@@ -1,11 +1,15 @@
-
+import copy
 import numpy as np
 import random
-from torch import flatten
-import torch.nn.functional as F
-from torchvision import transforms
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from mpmath import workdps
+from torch import flatten
+from torchvision import transforms
+from candycrunch.Tokenizer import GlycoBartTokenizer
+tokenizer = GlycoBartTokenizer
+
 import copy
 import inspect
 # print(torch.__version__)
@@ -47,9 +51,7 @@ transform_rt = transforms.Compose([
 ])
 
 
-
 class SimpleDataset(torch.utils.data.Dataset):
-
     def __init__(self, x, y, transform_mz=None, transform_rt=None):
         self.x = x
         self.y = y
@@ -92,12 +94,14 @@ class SimpleDataset(torch.utils.data.Dataset):
             torch.LongTensor([out]),
         )
 
-class TransDataset(torch.utils.data.Dataset):
 
-    def __init__(self, x, y, transform_rt=None):
+class TransDataset(torch.utils.data.Dataset):
+    def __init__(self, x, y, tokenizer, transform_rt=None):
         self.x = x
         self.y = y
+        self.tokenizer = tokenizer
         self.transform_rt = transform_rt
+        self.encoded_targets = self.tokenizer.encode(self.y)
 
     def __len__(self):
         return len(self.x)
@@ -111,15 +115,21 @@ class TransDataset(torch.utils.data.Dataset):
         lc = self.x[index][7]
         modification = self.x[index][8]
         trap = self.x[index][9]
-        out = self.y[index]
 
         if self.transform_rt:
             RT = self.transform_rt(RT)
 
         peak_list = torch.FloatTensor(peak_list)
-
-        # True means "ignore this token" for PyTorch Transformer padding masks.
         peak_padding_mask = peak_list.abs().sum(dim=-1) == 0
+
+        tgt_ids = self.encoded_targets["token_ids"][index]
+
+        # Decoder input excludes final token (EOS/PAD); targets for loss excludes initial BOS token
+        decoder_input_ids = tgt_ids[:-1].clone()
+        target_labels = tgt_ids[1:].clone()
+
+        pad_id = self.tokenizer.vocab[self.tokenizer.special_tokens['pad_token']]
+        tgt_key_padding_mask = (decoder_input_ids == pad_id)
 
         return (
             peak_list,
@@ -131,7 +141,9 @@ class TransDataset(torch.utils.data.Dataset):
             torch.LongTensor([lc]),
             torch.LongTensor([modification]),
             torch.LongTensor([trap]),
-            torch.LongTensor([out]),
+            decoder_input_ids,
+            tgt_key_padding_mask,
+            target_labels
         )
 
 
@@ -139,11 +151,11 @@ class PeakResBlock(nn.Module):
     def __init__(self, peak_hidden_dim, dropout=0.2, kernel_size=3, dilations=(1, 2, 4, 8), causal=False):
         super().__init__()
         self.resunits = nn.Sequential(*[ResUnit(in_channels=peak_hidden_dim, size=kernel_size, dilation=dilation,
-                                                causal=causal, in_ln=True,) for dilation in dilations])
+                                                causal=causal, in_ln=True) for dilation in dilations])
         self.dropout = nn.Dropout(dropout)
     def forward(self, peak_features, peak_padding_mask=None):
         if peak_padding_mask is not None:
-            peak_features = peak_features.masked_fill( peak_padding_mask.unsqueeze(-1), 0.0)
+            peak_features = peak_features.masked_fill(peak_padding_mask.unsqueeze(-1), 0.0)
         peak_features = peak_features.transpose(1, 2)
         peak_features = self.resunits(peak_features)
         peak_features = peak_features.transpose(1, 2)
@@ -537,8 +549,21 @@ class CandyCrunch_Transformer(nn.Module):
                                       make_norm(norm_type, metadata_dim),
                                       make_activation(activation))
 
-        combined_dim = peak_hidden_dim + 7 * metadata_dim
+        # Decoder components
+        self.vocab_size = num_classes
+        self.tgt_tok_emb = nn.Embedding(self.vocab_size, peak_hidden_dim)
+        self.tgt_pos_emb = nn.Embedding(1024, peak_hidden_dim)
+        self.meta_proj = nn.Linear(7 * metadata_dim, peak_hidden_dim)
 
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=peak_hidden_dim, nhead=heads, dim_feedforward=ff_dim,
+            dropout=dropout, batch_first=True, activation=encoder_activation
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=layers)
+        self.fc_out = nn.Linear(peak_hidden_dim, self.vocab_size)
+        #############
+        """
+        combined_dim = peak_hidden_dim + 7 * metadata_dim
         self.classifier_rep = nn.Sequential(nn.Linear(combined_dim, 1024),
                                             make_norm(norm_type, 1024),
                                             make_activation(activation),
@@ -547,9 +572,8 @@ class CandyCrunch_Transformer(nn.Module):
                                             make_norm(norm_type, 512),
                                             make_activation(activation),
                                             nn.Dropout(dropout))
-
         self.classifier_out = nn.Linear(512, num_classes)
-
+        """
     def encode_mz(self, mz):
         half_dim = self.mz_encoding_dim // 2
         wavelengths = (self.lambda_min * (self.lambda_max / self.lambda_min) **
@@ -575,7 +599,9 @@ class CandyCrunch_Transformer(nn.Module):
         if aux_loss is None:
             return torch.tensor(0.0, device=self.cls_token.device, dtype=self.cls_token.dtype)
         return aux_loss
-    def forward(self, peak_list, peak_padding_mask, precursor, glycan_type, rt, mode, lc, modification, trap, rep=False):
+    # Changed for decoder
+    def forward(self, peak_list, peak_padding_mask, precursor, glycan_type, rt, mode, lc, modification, trap,
+                tgt_input_ids=None, tgt_key_padding_mask=None, tgt_mask=None):
         batch_size = peak_list.size(0)
         peak_features = self.make_peak_embedding(peak_list)
         if self.use_resunits:
@@ -585,7 +611,6 @@ class CandyCrunch_Transformer(nn.Module):
         cls_padding = torch.zeros(batch_size, 1, dtype=torch.bool, device=peak_padding_mask.device)
         transformer_padding_mask = torch.cat([cls_padding, peak_padding_mask], dim=1)
         peak_features = self.transformer(peak_features,src_key_padding_mask=transformer_padding_mask)
-        spectrum_rep = peak_features[:, 0, :]
         glycan_type = self.type_emb(glycan_type).squeeze(1)
         mode = self.mode_emb(mode).squeeze(1)
         lc = self.lc_emb(lc).squeeze(1)
@@ -593,9 +618,29 @@ class CandyCrunch_Transformer(nn.Module):
         trap = self.trap_emb(trap).squeeze(1)
         precursor = self.prec_block(precursor)
         rt = self.rt_block(rt)
+        """
         comb = torch.cat([spectrum_rep, precursor, glycan_type, rt, mode, lc, modification, trap], dim=1)
         comb_rep = self.classifier_rep(comb)
         comb = self.classifier_out(comb_rep)
         if rep:
             return comb, comb_rep
         return comb
+        """
+        meta_cat = torch.cat([precursor, glycan_type, rt, mode, lc, modification, trap], dim=1)
+        meta_token = self.meta_proj(meta_cat).unsqueeze(1)
+        memory = torch.cat([peak_features, meta_token], dim=1)
+        meta_padding = torch.zeros(batch_size, 1, dtype=torch.bool, device=peak_padding_mask.device)
+        memory_key_padding_mask = torch.cat([transformer_padding_mask, meta_padding], dim=1)
+        seq_len = tgt_input_ids.size(1)
+        if tgt_mask is None:
+            tgt_mask = nn.Transformer.generate_square_subsequent_mask(seq_len, device=tgt_input_ids.device, dtype=torch.bool)
+        positions = torch.arange(seq_len, device=tgt_input_ids.device).unsqueeze(0).expand(batch_size, seq_len)
+        tgt_emb = self.tgt_tok_emb(tgt_input_ids) + self.tgt_pos_emb(positions)
+        out = self.decoder(
+            tgt=tgt_emb,
+            memory=memory,
+            tgt_mask=tgt_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            memory_key_padding_mask=memory_key_padding_mask
+        )
+        return self.fc_out(out)
