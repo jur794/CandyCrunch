@@ -22,8 +22,10 @@ from glycowork.motif.tokenization import (composition_to_mass,
                                           mz_to_composition, structure_to_basic)
 from glycowork.network.biosynthesis import construct_network, evoprune_network
 from pyteomics import mzxml
-from candycrunch.model import (CandyCrunch_CNN, CandyCrunch_Transformer, SimpleDataset, TransDataset,
-                               transform_mz, transform_rt)
+from glycowork.motif.processing import canonicalize_iupac
+from candycrunch.model import (CandyCrunch_CNN, CandyCrunch_Transformer, CandyCrunch_CNN_Decoder,
+                               SimpleDataset, TransDataset, SeqSimpleDataset, transform_mz, transform_rt)
+from candycrunch.BPETokenizer import BPETokenizer
 from candycrunch.analysis import CandyCrumbs
 
 _, this_filename = os.path.split(__file__)
@@ -39,6 +41,7 @@ if torch.cuda.is_available():
 MODEL_CLASSES = {
     "CandyCrunch_CNN": CandyCrunch_CNN,
     "CandyCrunch_Transformer": CandyCrunch_Transformer,
+    "CandyCrunch_CNN_Decoder": CandyCrunch_CNN_Decoder,
 }
 
 MODEL_DIR = "/Users/xatava/CandyCrunch/training/models"
@@ -46,6 +49,7 @@ MODEL_DIR = "/Users/xatava/CandyCrunch/training/models"
 DEFAULT_MODEL_PATHS = {
     "CNN": os.path.join(MODEL_DIR, "CandyCrunch_CNN_GShS_DSS4.0.pt"),
     "Transformer": os.path.join(MODEL_DIR, "CandyCrunch_Transformer_DENSE_GShS_H4L2FFD512MP512_PE(fourier)_N(rms)_ACT(leaky_relu)_RU(False)_org.pt"),
+    "CNN_Decoder": os.path.join(MODEL_DIR, "CandyCrunch_CNNDec.pt"),
 }
 
 _loaded_models = {}
@@ -70,6 +74,9 @@ def _resolve_model_path(model):
     if model_key.lower() == "transformer":
         return DEFAULT_MODEL_PATHS["Transformer"]
 
+    if model_key.lower() in {"cnn_decoder", "cnndecoder"}:
+        return DEFAULT_MODEL_PATHS["CNN_Decoder"]
+
     if os.path.isfile(model_key):
         return model_key
 
@@ -84,12 +91,17 @@ def _canonical_model_name(model):
             return "CNN"
         if model.lower() == "transformer":
             return "Transformer"
+        if model.lower() in {"cnn_decoder", "cnndecoder"}:
+            return "CNN_Decoder"
         if model.endswith((".pt", ".pth")):
             return _canonical_model_name(get_model(model))
 
     model_type = getattr(model, "_candycrunch_model_type", None)
-    if model_type in {"CNN", "Transformer"}:
+    if model_type in {"CNN", "Transformer", "CNN_Decoder"}:
         return model_type
+
+    if isinstance(model, CandyCrunch_CNN_Decoder):
+        return "CNN_Decoder"
 
     if isinstance(model, CandyCrunch_CNN):
         return "CNN"
@@ -98,8 +110,8 @@ def _canonical_model_name(model):
         return "Transformer"
 
     raise ValueError(
-        "model must be 'CNN', 'Transformer', a checkpoint path, "
-        "CandyCrunch_CNN, or CandyCrunch_Transformer."
+        "model must be 'CNN', 'Transformer', 'CNN_Decoder', a checkpoint path, "
+        "CandyCrunch_CNN, CandyCrunch_Transformer, or CandyCrunch_CNN_Decoder."
     )
 
 
@@ -137,6 +149,19 @@ def load_checkpoint_model(checkpoint_path):
     loaded_model._candycrunch_glycans = checkpoint.get("glycans")
     loaded_model._candycrunch_comp_vector_order = checkpoint.get("comp_vector_order")
     loaded_model._candycrunch_max_peaks = checkpoint.get("max_peaks")
+
+    if checkpoint.get("tokenizer_vocab") is not None:
+        tokenizer = BPETokenizer(
+            structural_symbols=checkpoint.get("tokenizer_structural"),
+            max_seq_length=checkpoint.get("tokenizer_max_seq_length", 512),
+        )
+        tokenizer.vocab = {t: int(i) for t, i in checkpoint["tokenizer_vocab"].items()}
+        tokenizer.reverse_vocab = {i: t for t, i in tokenizer.vocab.items()}
+        tokenizer.merges = [tuple(pair) for pair in checkpoint.get("tokenizer_merges", [])]
+        loaded_model._candycrunch_tokenizer = tokenizer
+    else:
+        loaded_model._candycrunch_tokenizer = None
+    loaded_model._candycrunch_target_len = checkpoint.get("target_len")
 
     return loaded_model
 
@@ -181,7 +206,17 @@ MODEL_INFERENCE_DEFAULTS = {
         "test_time_copies": 5,
         "augment_mz": False,
         "augment_rt": False,
-    }
+    },
+    "CNN_Decoder": {
+        "temperature": torch.Tensor([1.0]).to(device),
+        "pred_thresh": 0.01,
+        "extra_thresh": 0.2,
+        "test_time_copies": 5,
+        "augment_mz": True,
+        "augment_rt": True,
+        "beam_width": 25,
+        "length_penalty": 0.7,
+    },
 }
 
 def get_adduct_list(mode):
@@ -536,6 +571,157 @@ def get_topk(dataloader, model, glycans=None, k= 25, temp= False, temperature= t
         start_idx = end_idx
     preds = [[glycans[i] for i in j] for j in preds]
     return preds, conf.tolist()
+
+
+def _safe_canonicalize(iupac_string):
+    """Canonicalizes an IUPAC-condensed string, returning None on failure instead of the raw
+    string -- a malformed/non-canonicalizable generated string must not flow into wrap_inference's
+    mass filter or CandyCrumbs, which expect a syntactically valid glycan graph."""
+    try:
+        return canonicalize_iupac(iupac_string)
+    except Exception:
+        return None
+
+
+def beam_search_topk(dataloader, model, tokenizer=None, k=25, max_length=None,
+                     length_penalty=0.7, temperature=None, return_discard_rate=False):
+    """autoregressively beam-searches topk IUPAC-condensed glycan strings for spectra in dataloader
+    (CandyCrunch_CNN_Decoder only). Shape-identical return to get_topk, so wrap_inference's
+    downstream code (composition filter, CandyCrumbs, biosynthesis-network supplementation,
+    canonicalize_biosynthesis, GlyTouCan mapping) runs unchanged.\n
+   | Arguments:
+   | :-
+   | dataloader (PyTorch): dataloader from process_for_inference (CNN_Decoder -> SimpleDataset features)
+   | model (PyTorch): trained CandyCrunch_CNN_Decoder model
+   | tokenizer (BPETokenizer): tokenizer the model's decoder was trained with; default: the one
+   |                           stored on the checkpoint (model._candycrunch_tokenizer)
+   | k (int): beam width / number of candidates to return per spectrum; default:25
+   | max_length (int): maximum number of decoding steps; default: model._candycrunch_target_len
+   | length_penalty (float): GNMT-style length normalization exponent; default:0.7
+   | temperature (float): softens/sharpens the softmax over deduped beam scores; default:1.0
+   | return_discard_rate (bool): also return the fraction of beams dropped for failing
+   |                            canonicalization (a decoder-undertraining diagnostic); default:False\n
+   | Returns:
+   | :-
+   | (1) preds: list of length n_rows; each entry <= k canonical IUPAC strings, best first
+   | (2) conf: list of length n_rows; each entry the parallel probability list (sums to ~1)
+   | (3) discard_rate (only if return_discard_rate=True): beams dropped / beams produced
+   """
+    model = get_model(model)
+    model_name = _canonical_model_name(model)
+    if model_name != 'CNN_Decoder':
+        raise ValueError("beam_search_topk only supports CandyCrunch_CNN_Decoder; use get_topk for CNN/Transformer.")
+
+    if tokenizer is None:
+        tokenizer = getattr(model, "_candycrunch_tokenizer", None)
+    if tokenizer is None:
+        raise ValueError(
+            "No tokenizer available for this model -- pass tokenizer= explicitly, or use a "
+            "checkpoint that has one stored (see training_script.py's checkpoint_metadata)."
+        )
+    if max_length is None:
+        max_length = getattr(model, "_candycrunch_target_len", None) or tokenizer.max_seq_length
+    if temperature is None:
+        temperature = 1.0
+    if torch.is_tensor(temperature):
+        temperature = float(temperature.item())
+
+    bos_id = tokenizer.vocab[tokenizer.special_tokens['bos_token']]
+    eos_id = tokenizer.vocab[tokenizer.special_tokens['eos_token']]
+
+    model.eval()
+    all_preds, all_confs = [], []
+    n_beams_total, n_beams_discarded = 0, 0
+
+    with torch.no_grad():
+        for data in dataloader:
+            mz_list, peak_list, mz_remainder, precursor, glycan_type, rt, mode, lc, modification, trap, y = data
+            mz_features = torch.stack([mz_list, mz_remainder], dim=1).to(device)
+            enc_inputs = [mz_features, precursor.to(device), glycan_type.to(device), rt.to(device),
+                         mode.to(device), lc.to(device), modification.to(device), trap.to(device)]
+
+            memory, mem_mask, _ = model.encode(*enc_inputs)
+            batch_size = memory.size(0)
+
+            memory = memory.repeat_interleave(k, dim=0)
+            if mem_mask is not None:
+                mem_mask = mem_mask.repeat_interleave(k, dim=0)
+
+            tokens = torch.full((batch_size * k, 1), bos_id, dtype=torch.long, device=device)
+            scores = torch.full((batch_size, k), float("-inf"), device=device)
+            scores[:, 0] = 0.0
+            finished = torch.zeros(batch_size * k, dtype=torch.bool, device=device)
+            lengths = torch.zeros(batch_size * k, dtype=torch.long, device=device)
+
+            for _ in range(max_length - 1):
+                logits = model.decode_step(memory, tokens, memory_key_padding_mask=mem_mask)
+                log_probs = F.log_softmax(logits[:, -1, :], dim=-1)   # (B*k, V)
+
+                # Freeze finished beams: re-emitting <eos> at zero cost so their cumulative
+                # score never changes, letting them compete fairly against growing beams.
+                if finished.any():
+                    log_probs = log_probs.clone()
+                    log_probs[finished] = float("-inf")
+                    log_probs[finished, eos_id] = 0.0
+
+                cand = scores.view(-1, 1) + log_probs                 # (B*k, V)
+                cand = cand.view(batch_size, k * log_probs.size(-1))
+                top_scores, flat_idx = cand.topk(k, dim=-1)
+
+                vocab_size = log_probs.size(-1)
+                beam_idx = flat_idx // vocab_size                     # (B, k)
+                token_idx = flat_idx % vocab_size                     # (B, k)
+
+                batch_offsets = (torch.arange(batch_size, device=device) * k).unsqueeze(1)
+                gather_idx = (beam_idx + batch_offsets).view(-1)
+
+                tokens = torch.cat([tokens[gather_idx], token_idx.view(-1, 1)], dim=1)
+                finished = finished[gather_idx]
+                lengths = lengths[gather_idx] + (~finished).long()
+                finished = finished | (token_idx.view(-1) == eos_id)
+                scores = top_scores
+
+                if finished.all():
+                    break
+
+            norm_scores = scores.view(-1) / lengths.clamp(min=1).float().pow(length_penalty)
+            norm_scores = norm_scores.view(batch_size, k).cpu()
+            tokens = tokens.view(batch_size, k, -1).cpu()
+
+            for row in range(batch_size):
+                strings = tokenizer.decode(tokens[row], skip_special_tokens=True)
+                if isinstance(strings, str):
+                    strings = [strings]
+
+                best = {}
+                for s, sc in zip(strings, norm_scores[row].tolist()):
+                    n_beams_total += 1
+                    if not s:
+                        n_beams_discarded += 1
+                        continue
+                    canon = _safe_canonicalize(s)
+                    if canon is None:
+                        n_beams_discarded += 1
+                        continue
+                    if canon not in best or sc > best[canon]:
+                        best[canon] = sc
+
+                if not best:
+                    all_preds.append([])
+                    all_confs.append([])
+                    continue
+
+                keys = list(best.keys())
+                vals = torch.tensor([best[key] for key in keys], dtype=torch.float32)
+                probs = F.softmax(vals / temperature, dim=0).tolist()
+                order = sorted(range(len(keys)), key=lambda i: probs[i], reverse=True)
+                all_preds.append([keys[i] for i in order])
+                all_confs.append([probs[i] for i in order])
+
+    if return_discard_rate:
+        discard_rate = n_beams_discarded / max(n_beams_total, 1)
+        return all_preds, all_confs, discard_rate
+    return all_preds, all_confs
 
 
 comp_cache = {}
@@ -1893,7 +2079,16 @@ def wrap_inference(spectra_filepath, glycan_class, model= candycrunch, glycans=N
         model = model,
     )
     # Predict glycans from spectra
-    preds, pred_conf = get_topk(loader, model, glycans, temp = True, temperature = temperature)
+    if model_name == 'CNN_Decoder':
+        preds, pred_conf = beam_search_topk(
+            loader, model,
+            tokenizer = getattr(model, "_candycrunch_tokenizer", None),
+            k = model_defaults.get("beam_width", 25),
+            max_length = getattr(model, "_candycrunch_target_len", None),
+            length_penalty = model_defaults.get("length_penalty", 0.7),
+            temperature = temperature)
+    else:
+        preds, pred_conf = get_topk(loader, model, glycans, temp = True, temperature = temperature)
     # Average over 5 augmented copies of each spectrum produced during inference
     pred_chunks = [preds[i:i + test_time_copies] for i in range(0, len(preds), test_time_copies)]
     conf_chunks = [pred_conf[i:i + test_time_copies] for i in range(0, len(pred_conf), test_time_copies)]

@@ -3,6 +3,7 @@ import json
 import numpy as np
 import time
 import torch
+import torch.nn as nn
 import wandb
 import logging
 import warnings
@@ -171,9 +172,44 @@ def prepare_batch(data, model_type):
 
         y = y.squeeze().to(device)
 
+    elif model_type == "CNN_Decoder":
+        (
+            mz_list,
+            peak_list,
+            mz_remainder,
+            precursor,
+            glycan_type,
+            rt,
+            mode_in,
+            lc,
+            modification,
+            trap,
+            y_class,
+            decoder_input_ids,
+            tgt_key_padding_mask,
+            target_labels,
+        ) = data
+
+        mz_features = torch.stack([mz_list, mz_remainder], dim=1).to(device)
+
+        inputs = [
+            mz_features,
+            precursor.to(device),
+            glycan_type.to(device),
+            rt.to(device),
+            mode_in.to(device),
+            lc.to(device),
+            modification.to(device),
+            trap.to(device),
+            decoder_input_ids.to(device),
+            tgt_key_padding_mask.to(device),
+        ]
+
+        y = (target_labels.to(device), y_class.squeeze().to(device))
+
     else:
         raise ValueError(
-            f"Unknown model_type={model_type!r}. Expected 'CNN' or 'Transformer'."
+            f"Unknown model_type={model_type!r}. Expected 'CNN', 'Transformer', or 'CNN_Decoder'."
         )
 
     return inputs, y
@@ -579,3 +615,381 @@ def train_model(model, dataloaders, criterion, optimizer,
     model.load_state_dict(best_model_wts)
 
     return model
+
+
+def train_decoder_model(model, dataloaders, optimizer, scheduler, pad_token_id, vocab_size,
+                        class_criterion=None, class_loss_weight=0.0, num_epochs=None, patience=None,
+                        log_to_wandb=True, model_type="CNN_Decoder", setting_name=None,
+                        checkpoint_metadata=None, label_smoothing=0.1):
+    """trains CandyCrunch_CNN_Decoder to autoregressively generate IUPAC token sequences
+
+    Mirrors train_model's epoch/early-stopping/checkpoint/plotting scaffolding (same SAM
+    two-forward-pass optimizer pattern, same output file conventions), but loss/metrics operate
+    on token sequences (teacher-forced next-token prediction) plus an optional auxiliary
+    classification loss, instead of a single class label per sample.
+
+    Arguments:
+    :-
+    model (PyTorch object): CandyCrunch_CNN_Decoder
+    dataloaders (PyTorch object): dictionary of dataloader objects with keys 'train' and 'val'
+    optimizer (PyTorch object): SAM-style optimizer with first_step/second_step
+    scheduler (PyTorch object): PyTorch learning rate decay
+    pad_token_id (int): tokenizer's pad token id, for ignore_index and masking
+    vocab_size (int): tokenizer's vocab size
+    class_criterion (PyTorch object): optional auxiliary classification loss (e.g. custom_loss(...))
+    class_loss_weight (float): weight on the auxiliary class_CE term; 0 disables it entirely
+    num_epochs (int): number of epochs for training
+    patience (int): number of epochs without improvement until early stop
+
+    Returns:
+    :-
+    Returns the best model seen during training
+    """
+    since = time.time()
+    early_stopping = EarlyStopping(patience = patience, verbose = True)
+    best_model_wts = copy.deepcopy(model.state_dict())
+    best_loss = 100.0
+    best_token_acc = 0.0
+    val_losses, val_token_acc = [], []
+    train_losses, train_token_acc = [], []
+
+    token_criterion = nn.CrossEntropyLoss(ignore_index = pad_token_id, label_smoothing = label_smoothing)
+
+    def compute_loss(token_logits, class_logits, target_labels, y_class):
+        loss = token_criterion(token_logits.reshape(-1, vocab_size), target_labels.reshape(-1))
+        class_loss = None
+        if class_loss_weight > 0 and class_criterion is not None:
+            class_loss = class_criterion(class_logits, y_class)
+            loss = loss + class_loss_weight * class_loss
+        return loss, class_loss
+
+    metric_names = ["loss", "token_accuracy", "sequence_accuracy", "token_perplexity", "class_accuracy"]
+    metrics_dict = {
+        "train": {name: [] for name in metric_names},
+        "val": {name: [] for name in metric_names},
+        "time_seconds": [],
+    }
+
+    start = time.time_ns()
+
+    for epoch in range(num_epochs):
+        print('Epoch {}/{}'.format(epoch, num_epochs - 1))
+        print('-' * 10)
+
+        for phase in ['train', 'val']:
+            if phase == 'train':
+                model.train()
+            else:
+                model.eval()
+
+            running_loss = []
+            running_token_correct = 0
+            running_token_total = 0
+            running_seq_correct = 0
+            running_seq_total = 0
+            running_class_correct = 0
+            running_class_total = 0
+
+            for data in dataloaders[phase]:
+                inputs, (target_labels, y_class) = prepare_batch(data, model_type)
+                optimizer.zero_grad(set_to_none = True)
+
+                with torch.set_grad_enabled(phase == 'train'):
+                    enable_running_stats(model)
+                    token_logits, class_logits = model(*inputs)
+                    loss, _ = compute_loss(token_logits, class_logits, target_labels, y_class)
+
+                    if phase == 'train':
+                        loss.backward()
+                        optimizer.first_step(zero_grad = True)
+
+                        # second forward pass for SAM
+                        disable_running_stats(model)
+                        token_logits2, class_logits2 = model(*inputs)
+                        loss2, _ = compute_loss(token_logits2, class_logits2, target_labels, y_class)
+                        loss2.backward()
+                        optimizer.second_step(zero_grad = True)
+
+                # Token-level accuracy (ignoring pad positions) and exact full-sequence match.
+                mask = (target_labels != pad_token_id)
+                pred_tokens = token_logits.argmax(dim = -1)
+                running_token_correct += int(((pred_tokens == target_labels) & mask).sum().item())
+                running_token_total += int(mask.sum().item())
+
+                seq_correct = ((pred_tokens == target_labels) | ~mask).all(dim = 1)
+                running_seq_correct += int(seq_correct.sum().item())
+                running_seq_total += seq_correct.size(0)
+
+                if class_loss_weight > 0 and class_criterion is not None:
+                    class_pred = class_logits.argmax(dim = -1)
+                    running_class_correct += int((class_pred == y_class).sum().item())
+                    running_class_total += y_class.size(0)
+
+                running_loss.append(loss.item())
+
+            epoch_loss = np.mean(running_loss)
+            epoch_token_acc = running_token_correct / max(running_token_total, 1)
+            epoch_seq_acc = running_seq_correct / max(running_seq_total, 1)
+            epoch_class_acc = running_class_correct / max(running_class_total, 1) if running_class_total else None
+            epoch_perplexity = float(np.exp(min(epoch_loss, 20.0)))
+
+            log_line = '{} Loss: {:.4f} Token-Acc: {:.4f} Seq-Acc: {:.4f} PPL: {:.2f}'.format(
+                phase, epoch_loss, epoch_token_acc, epoch_seq_acc, epoch_perplexity)
+            if epoch_class_acc is not None:
+                log_line += ' Class-Acc: {:.4f}'.format(epoch_class_acc)
+            print(log_line)
+
+            if log_to_wandb:
+                wandb_log = {
+                    f'{phase}/loss': epoch_loss,
+                    f'{phase}/token_accuracy': epoch_token_acc,
+                    f'{phase}/sequence_accuracy': epoch_seq_acc,
+                    f'{phase}/token_perplexity': epoch_perplexity,
+                    'epoch': epoch,
+                }
+                if epoch_class_acc is not None:
+                    wandb_log[f'{phase}/class_accuracy'] = epoch_class_acc
+                wandb.log(wandb_log)
+
+            metrics_dict[phase]["loss"].append(float(epoch_loss))
+            metrics_dict[phase]["token_accuracy"].append(float(epoch_token_acc))
+            metrics_dict[phase]["sequence_accuracy"].append(float(epoch_seq_acc))
+            metrics_dict[phase]["token_perplexity"].append(float(epoch_perplexity))
+            if epoch_class_acc is not None:
+                metrics_dict[phase]["class_accuracy"].append(float(epoch_class_acc))
+
+            if phase == 'val' and epoch_loss <= best_loss:
+                best_loss = epoch_loss
+                best_model_wts = copy.deepcopy(model.state_dict())
+            if phase == 'val' and epoch_seq_acc > best_token_acc:
+                best_token_acc = epoch_seq_acc
+            if phase == 'val':
+                val_losses.append(epoch_loss)
+                val_token_acc.append(epoch_seq_acc)
+                early_stopping(epoch_loss, model)
+                scheduler.step(epoch_loss)
+            if phase == 'train':
+                train_losses.append(epoch_loss)
+                train_token_acc.append(epoch_seq_acc)
+
+            torch.cuda.empty_cache()
+
+        if early_stopping.early_stop:
+            print("Early stopping")
+            break
+
+        print()
+        print(f"Time since start: {(time.time_ns() - start) / 1e9:.2f} seconds")
+        metrics_dict["time_seconds"].append(float((time.time_ns() - start) / 1e9))
+
+    time_elapsed = time.time() - since
+    print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
+    print('Best val loss: {:.4f}, best sequence accuracy: {:.4f}'.format(best_loss, best_token_acc))
+
+    os.makedirs("./models", exist_ok = True)
+
+    metrics_path = f'./models/CandyCrunch_metrics_{setting_name}.json'
+    plot_path = f'./models/CandyCrunch_metric_{setting_name}.png'
+    metrics_dict["best"] = {
+        "val_loss": float(best_loss),
+        "val_sequence_accuracy": float(best_token_acc),
+    }
+    metrics_dict["completed_epochs"] = len(metrics_dict["val"]["loss"])
+
+    with open(metrics_path, "w") as f:
+        json.dump(metrics_dict, f, indent = 2)
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize = (10, 8))
+
+    ax1.plot(range(len(val_losses)), val_losses, label = 'Validation')
+    ax1.plot(range(len(train_losses)), train_losses, label = 'Training')
+    ax1.set_ylabel('Loss')
+    ax1.set_title('Model Training - Loss')
+    ax1.legend()
+    ax1.grid(True, alpha = 0.3)
+
+    ax2.plot(range(len(val_token_acc)), val_token_acc, label = 'Validation')
+    ax2.plot(range(len(train_token_acc)), train_token_acc, label = 'Training')
+    ax2.set_xlabel('Number of Epochs')
+    ax2.set_ylabel('Sequence Accuracy')
+    ax2.set_title('Model Training - Sequence Accuracy')
+    ax2.legend()
+    ax2.grid(True, alpha = 0.3)
+
+    plt.tight_layout()
+    plt.savefig(plot_path, dpi = 300, bbox_inches = 'tight')
+    plt.close()
+
+    best_model_path = f'./models/CandyCrunch_{setting_name}.pt'
+
+    checkpoint = dict(checkpoint_metadata or {})
+    checkpoint["state_dict"] = best_model_wts
+    checkpoint["best_val_loss"] = float(best_loss)
+    checkpoint["best_val_sequence_accuracy"] = float(best_token_acc)
+    torch.save(checkpoint, best_model_path)
+
+    if log_to_wandb:
+        wandb.log({
+            'training_plots/loss_curves': wandb.Image(plot_path),
+            'best_metrics/best_val_loss': best_loss,
+            'best_metrics/best_val_sequence_accuracy': best_token_acc,
+        })
+        wandb.save(best_model_path)
+        wandb.save(metrics_path)
+
+    model.load_state_dict(best_model_wts)
+
+    return model
+
+
+def fit_beam_temperature(beam_scores, target_ranks, grid=None):
+    """fits a single scalar temperature to calibrate beam-search confidence scores
+
+    Grid search (not gradient descent) over a scalar T minimizing the mean negative
+    log-likelihood of softmax(scores / T) at the target rank -- the beam-search analogue of
+    Platt scaling. Rows where the true glycan wasn't found in any beam (target_ranks[i] is None)
+    are dropped from the fit; the coverage rate (rows kept / rows total) is returned too, since
+    low coverage is itself informative (a calibration run can't fix a decoder that isn't finding
+    the right structure at all).
+
+    Arguments:
+    :-
+    beam_scores (list[np.ndarray]): length-normalized log-probs per spectrum, one array per row
+    target_ranks (list[Optional[int]]): index into that row's array matching the true glycan, or
+                                        None if the truth wasn't present in any beam
+    grid (np.ndarray): candidate temperature values; default np.logspace(-1, 1, 81)
+
+    Returns:
+    :-
+    (T, coverage_rate): the fitted scalar temperature and the fraction of rows with a match
+    """
+    if grid is None:
+        grid = np.logspace(-1, 1, 81)
+
+    kept = [(scores, rank) for scores, rank in zip(beam_scores, target_ranks) if rank is not None]
+    coverage_rate = len(kept) / max(len(beam_scores), 1)
+    if not kept:
+        return 1.0, coverage_rate
+
+    best_T, best_nll = 1.0, float("inf")
+    for T in grid:
+        nlls = []
+        for scores, rank in kept:
+            log_probs = torch.log_softmax(torch.as_tensor(scores, dtype = torch.float32) / T, dim = 0)
+            nlls.append(-log_probs[rank].item())
+        mean_nll = float(np.mean(nlls))
+        if mean_nll < best_nll:
+            best_nll = mean_nll
+            best_T = float(T)
+
+    return best_T, coverage_rate
+
+
+def _calibrated_beam_probs(row_conf, temperature):
+    """Recomputes softmax(scores/T) from beam_search_topk's T=1 probabilities, without needing
+    the raw pre-softmax scores: since softmax is invariant to a constant per-row shift, and
+    log(T=1 probs) is the true scores shifted by exactly such a constant (their logsumexp),
+    softmax(log(T=1 probs) / T) == softmax(true_scores / T) for any T. So there's no need for a
+    separate raw-scores return path on beam_search_topk -- this reconstructs it exactly."""
+    scores = np.log(np.clip(np.asarray(row_conf, dtype = np.float64), 1e-12, None))
+    shifted = (scores - scores.max()) / temperature
+    exp_scores = np.exp(shifted)
+    return exp_scores / exp_scores.sum()
+
+
+def calibrate_decoder_checkpoint(checkpoint_path, val_dataloader, val_true_glycans, glycan_class,
+                                 tokenizer, k=25, length_penalty=0.7,
+                                 pred_thresh_grid=None, extra_thresh_grid=None):
+    """calibrates a trained CandyCrunch_CNN_Decoder checkpoint on a held-out validation set
+
+    Runs beam search once (temperature=1.0) on the val set, fits a single scalar temperature via
+    fit_beam_temperature, and sweeps a small pred_thresh x extra_thresh grid mirroring
+    wrap_inference's actual filter predicate (enforce_class(...) and confidence > pred_thresh) to
+    report top-1 accuracy and mean surviving-candidate count per combination. Writes the fitted
+    temperature/pred_thresh/extra_thresh/beam_width/length_penalty into the checkpoint's
+    inference_defaults dict in place -- wrap_inference already reads
+    checkpoint.get("inference_defaults", ...), so no consumption-side code changes are needed.
+
+    Arguments:
+    :-
+    checkpoint_path (str): path to a CandyCrunch_CNN_Decoder .pt checkpoint (updated in place)
+    val_dataloader (PyTorch): dataloader from process_for_inference over the held-out val split
+    val_true_glycans (list[str]): ground-truth IUPAC string per row of val_dataloader, same order
+    glycan_class (str): glycan class as used by glycowork's enforce_class ("O", "N", "lipid", "free")
+    tokenizer (BPETokenizer): tokenizer the model's decoder was trained with
+    k (int): beam width; default:25
+    length_penalty (float): GNMT-style length normalization exponent; default:0.7
+    pred_thresh_grid, extra_thresh_grid (list[float]): threshold values to sweep; sensible
+                                                       defaults provided
+
+    Returns:
+    :-
+    A dict summarizing the fitted temperature, coverage@k, beam discard rate, and the full
+    pred_thresh/extra_thresh grid results (also what gets printed).
+    """
+    from candycrunch.prediction import beam_search_topk, get_model, _safe_canonicalize
+    from glycowork.motif.processing import enforce_class
+
+    model = get_model(checkpoint_path)
+    preds, confs, discard_rate = beam_search_topk(
+        val_dataloader, model, tokenizer = tokenizer, k = k,
+        max_length = getattr(model, "_candycrunch_target_len", None),
+        length_penalty = length_penalty, temperature = 1.0, return_discard_rate = True)
+
+    canon_truth = [_safe_canonicalize(g) for g in val_true_glycans]
+
+    beam_scores, target_ranks = [], []
+    for row_preds, row_conf, truth in zip(preds, confs, canon_truth):
+        scores = np.log(np.clip(np.asarray(row_conf, dtype = np.float64), 1e-12, None))
+        beam_scores.append(scores)
+        target_ranks.append(row_preds.index(truth) if truth in row_preds else None)
+
+    T, coverage = fit_beam_temperature(beam_scores, target_ranks)
+    print(f"Fitted temperature T={T:.3f}, coverage@{k}={coverage:.3f}, beam discard rate={discard_rate:.3f}")
+
+    if pred_thresh_grid is None:
+        pred_thresh_grid = [0.005, 0.01, 0.02, 0.05]
+    if extra_thresh_grid is None:
+        extra_thresh_grid = [0.1, 0.2, 0.3, 0.5]
+
+    grid_results = []
+    for pred_thresh in pred_thresh_grid:
+        for extra_thresh in extra_thresh_grid:
+            n_correct, n_total, survivor_counts = 0, 0, []
+            for row_preds, row_conf, truth in zip(preds, confs, canon_truth):
+                if truth is None or not row_preds:
+                    continue
+                n_total += 1
+                calibrated = _calibrated_beam_probs(row_conf, T)
+                survivors = [g for g, c in zip(row_preds, calibrated)
+                            if c > pred_thresh and enforce_class(g, glycan_class, c, extra_thresh = extra_thresh)]
+                survivor_counts.append(len(survivors))
+                if survivors and survivors[0] == truth:
+                    n_correct += 1
+            grid_results.append({
+                "pred_thresh": pred_thresh, "extra_thresh": extra_thresh,
+                "top1_accuracy": n_correct / max(n_total, 1),
+                "mean_survivors": float(np.mean(survivor_counts)) if survivor_counts else 0.0,
+            })
+            print(f"  pred_thresh={pred_thresh} extra_thresh={extra_thresh}: "
+                 f"top1_acc={grid_results[-1]['top1_accuracy']:.3f} "
+                 f"mean_survivors={grid_results[-1]['mean_survivors']:.2f}")
+
+    best = max(grid_results, key = lambda r: r["top1_accuracy"])
+
+    checkpoint = torch.load(checkpoint_path, map_location = "cpu", weights_only = False)
+    checkpoint.setdefault("inference_defaults", {}).update({
+        "temperature": float(T), "pred_thresh": best["pred_thresh"], "extra_thresh": best["extra_thresh"],
+        "beam_width": k, "length_penalty": length_penalty,
+    })
+    checkpoint["calibration"] = {
+        "coverage_at_k": coverage, "beam_discard_rate": discard_rate,
+        "n_val_rows": len(val_true_glycans), "grid_results": grid_results,
+    }
+    torch.save(checkpoint, checkpoint_path)
+
+    return {
+        "temperature": T, "coverage_at_k": coverage, "beam_discard_rate": discard_rate,
+        "best_pred_thresh": best["pred_thresh"], "best_extra_thresh": best["extra_thresh"],
+        "grid_results": grid_results,
+    }

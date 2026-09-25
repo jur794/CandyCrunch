@@ -1,15 +1,11 @@
-import copy
+
 import numpy as np
 import random
+from torch import flatten
+import torch.nn.functional as F
+from torchvision import transforms
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from mpmath import workdps
-from torch import flatten
-from torchvision import transforms
-from candycrunch.Tokenizer import GlycoBartTokenizer
-tokenizer = GlycoBartTokenizer
-
 import copy
 import inspect
 # print(torch.__version__)
@@ -51,7 +47,9 @@ transform_rt = transforms.Compose([
 ])
 
 
+
 class SimpleDataset(torch.utils.data.Dataset):
+
     def __init__(self, x, y, transform_mz=None, transform_rt=None):
         self.x = x
         self.y = y
@@ -94,14 +92,43 @@ class SimpleDataset(torch.utils.data.Dataset):
             torch.LongTensor([out]),
         )
 
+class SeqSimpleDataset(SimpleDataset):
+    """SimpleDataset (CNN-style features + augmentation) plus BPE-tokenized decoder
+    targets, for training CandyCrunch_CNN_Decoder. Keeps the integer class label
+    (y_class) around too, for the optional auxiliary classification loss.
+
+    y_class: list[int]  -- glycans.index(...) labels, same as SimpleDataset's `y`
+    y_str:   list[str]  -- raw IUPAC strings, tokenized once here at construction
+    """
+
+    def __init__(self, x, y_class, y_str, tokenizer, transform_mz=None, transform_rt=None,
+                 max_target_len=None):
+        super().__init__(x, y_class, transform_mz=transform_mz, transform_rt=transform_rt)
+        self.pad_id = tokenizer.vocab[tokenizer.special_tokens['pad_token']]
+        ids = tokenizer.encode(list(y_str))["token_ids"]
+        # BPETokenizer.encode() pads to its fixed max_seq_length (512); trim down to the
+        # longest real sequence in this set so the decoder isn't wasting compute on padding.
+        nonpad = (ids != self.pad_id).any(dim=0).nonzero().max().item() + 1
+        if max_target_len is not None:
+            nonpad = min(nonpad, max_target_len)
+        self.encoded_targets = ids[:, :nonpad].contiguous()
+        self.target_len = nonpad
+
+    def __getitem__(self, index):
+        base = super().__getitem__(index)
+        tgt = self.encoded_targets[index]
+        decoder_input_ids = tgt[:-1].clone()
+        target_labels = tgt[1:].clone()
+        tgt_key_padding_mask = (decoder_input_ids == self.pad_id)
+        return base + (decoder_input_ids, tgt_key_padding_mask, target_labels)
+
 
 class TransDataset(torch.utils.data.Dataset):
-    def __init__(self, x, y, tokenizer, transform_rt=None):
+
+    def __init__(self, x, y, transform_rt=None):
         self.x = x
         self.y = y
-        self.tokenizer = tokenizer
         self.transform_rt = transform_rt
-        self.encoded_targets = self.tokenizer.encode(self.y)
 
     def __len__(self):
         return len(self.x)
@@ -115,21 +142,15 @@ class TransDataset(torch.utils.data.Dataset):
         lc = self.x[index][7]
         modification = self.x[index][8]
         trap = self.x[index][9]
+        out = self.y[index]
 
         if self.transform_rt:
             RT = self.transform_rt(RT)
 
         peak_list = torch.FloatTensor(peak_list)
+
+        # True means "ignore this token" for PyTorch Transformer padding masks.
         peak_padding_mask = peak_list.abs().sum(dim=-1) == 0
-
-        tgt_ids = self.encoded_targets["token_ids"][index]
-
-        # Decoder input excludes final token (EOS/PAD); targets for loss excludes initial BOS token
-        decoder_input_ids = tgt_ids[:-1].clone()
-        target_labels = tgt_ids[1:].clone()
-
-        pad_id = self.tokenizer.vocab[self.tokenizer.special_tokens['pad_token']]
-        tgt_key_padding_mask = (decoder_input_ids == pad_id)
 
         return (
             peak_list,
@@ -141,9 +162,7 @@ class TransDataset(torch.utils.data.Dataset):
             torch.LongTensor([lc]),
             torch.LongTensor([modification]),
             torch.LongTensor([trap]),
-            decoder_input_ids,
-            tgt_key_padding_mask,
-            target_labels
+            torch.LongTensor([out]),
         )
 
 
@@ -151,11 +170,11 @@ class PeakResBlock(nn.Module):
     def __init__(self, peak_hidden_dim, dropout=0.2, kernel_size=3, dilations=(1, 2, 4, 8), causal=False):
         super().__init__()
         self.resunits = nn.Sequential(*[ResUnit(in_channels=peak_hidden_dim, size=kernel_size, dilation=dilation,
-                                                causal=causal, in_ln=True) for dilation in dilations])
+                                                causal=causal, in_ln=True,) for dilation in dilations])
         self.dropout = nn.Dropout(dropout)
     def forward(self, peak_features, peak_padding_mask=None):
         if peak_padding_mask is not None:
-            peak_features = peak_features.masked_fill(peak_padding_mask.unsqueeze(-1), 0.0)
+            peak_features = peak_features.masked_fill( peak_padding_mask.unsqueeze(-1), 0.0)
         peak_features = peak_features.transpose(1, 2)
         peak_features = self.resunits(peak_features)
         peak_features = peak_features.transpose(1, 2)
@@ -254,7 +273,8 @@ class CandyCrunch_CNN(nn.Module):
                                          nn.Dropout(dropout))
         self.comb_lin2 = nn.Linear(2 * 256, num_classes)
 
-    def forward(self, mz_features, precursor, glycan_type, rt, mode, lc, modification, trap, rep=False):
+    def forward(self, mz_features, precursor, glycan_type, rt, mode, lc, modification, trap, rep=False,
+                return_feature_map=False):
         glycan_type = self.type_emb(glycan_type).squeeze(1)
         mode = self.mode_emb(mode).squeeze(1)
         lc = self.lc_emb(lc).squeeze(1)
@@ -263,6 +283,9 @@ class CandyCrunch_CNN(nn.Module):
         precursor = self.prec_block(precursor)
         rt = self.rt_block(rt)
         mz = self.res_block(mz_features)
+        # Per-position conv feature map (before pooling to a single vector), for callers that
+        # want to cross-attend to it (e.g. CandyCrunch_CNN_Decoder's "feature_map" memory mode).
+        feature_map = mz.transpose(1, 2) if return_feature_map else None
         mz = flatten(mz, start_dim=1)
         mz = self.fc_dropout(mz)
         mz = F.leaky_relu(self.fc1(mz))
@@ -271,10 +294,136 @@ class CandyCrunch_CNN(nn.Module):
         comb_rep = self.comb_lin1(comb)
         comb = self.comb_block2(comb_rep)
         comb = self.comb_lin2(comb)
+        if return_feature_map:
+            return comb, comb_rep, feature_map
         if rep:
             return comb, comb_rep
         else:
             return comb
+
+
+class CandyCrunch_CNN_Decoder(nn.Module):
+    """Autoregressive IUPAC-string decoder cross-attending to a pretrained CandyCrunch_CNN's
+    spectrum representation.
+
+    memory_mode="simple": memory is the single penultimate vector (`comb_rep`, 512-dim,
+    already exposed by CandyCrunch_CNN via `rep=True`) projected to one memory token.
+    memory_mode="feature_map": memory is the pre-pool per-position conv feature map (102
+    positions, exposed via `return_feature_map=True`) plus one metadata token, so the decoder
+    can cross-attend to different regions of the spectrum. Swapping between the two only
+    changes `encode()`'s memory construction -- the decoder, loss, and beam search are
+    identical either way.
+    """
+
+    def __init__(self, base_model_kwargs, vocab_size, d_model=256, nhead=8, num_layers=3,
+                 dim_feedforward=1024, dropout=0.1, memory_mode="simple", max_target_len=512,
+                 activation="gelu", pad_token_id=0, bos_token_id=1, eos_token_id=2):
+        super().__init__()
+        if memory_mode not in ("simple", "feature_map"):
+            raise ValueError(f"Unknown memory_mode={memory_mode!r}. Use 'simple' or 'feature_map'.")
+
+        self.cnn = CandyCrunch_CNN(**base_model_kwargs)
+        self.memory_mode = memory_mode
+        self.vocab_size = vocab_size
+        self.pad_token_id = pad_token_id
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
+
+        rep_dim = self.cnn.comb_lin1.out_features           # 512
+        metadata_dim = self.cnn.type_emb.embedding_dim       # 24
+        fmap_channels = self.cnn.res_block[-2].conv_out.out_channels   # 64, last ResUnit before the pool
+
+        if memory_mode == "simple":
+            self.rep_proj = nn.Linear(rep_dim, d_model)
+        else:
+            self.fmap_proj = nn.Linear(fmap_channels, d_model)
+            self.fmap_pos_emb = nn.Embedding(102, d_model)
+            self.meta_proj = nn.Linear(7 * metadata_dim, d_model)
+
+        self.tgt_tok_emb = nn.Embedding(vocab_size, d_model, padding_idx=pad_token_id)
+        self.tgt_pos_emb = nn.Embedding(max_target_len, d_model)
+        decoder_layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=nhead,
+                                                   dim_feedforward=dim_feedforward, dropout=dropout,
+                                                   batch_first=True, activation=activation, norm_first=True)
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers,
+                                             norm=nn.LayerNorm(d_model))
+        self.fc_out = nn.Linear(d_model, vocab_size)
+
+    def load_pretrained_cnn(self, checkpoint_path, strict=True):
+        """Loads CandyCrunch_CNN weights from an existing CNN checkpoint into self.cnn.
+
+        Returns the checkpoint dict so the caller can assert compatibility (glycan label set,
+        comp_vector_order, and -- critically -- that this checkpoint's train/test split matches
+        the split being used to train the decoder; otherwise "validation" spectra here may have
+        been training data for this encoder, silently inflating decoder validation accuracy).
+
+        No freeze/unfreeze here by design: the decoder is currently trained end-to-end with the
+        loaded encoder, not staged frozen-then-unfrozen. A frozen-encoder + differential-LR
+        fine-tuning experiment is a deferred future option, not implemented now.
+        """
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        state_dict = checkpoint["state_dict"]
+        state_dict = {k[len("module."):] if k.startswith("module.") else k: v
+                     for k, v in state_dict.items()}
+        self.cnn.load_state_dict(state_dict, strict=strict)
+        return checkpoint
+
+    def encode(self, mz_features, precursor, glycan_type, rt, mode, lc, modification, trap):
+        """Returns (memory, memory_key_padding_mask, class_logits).
+        memory: (B, 1, d_model) in "simple" mode, (B, 103, d_model) in "feature_map" mode.
+        memory_key_padding_mask: None -- every memory token is always valid.
+        class_logits: (B, num_classes), the CNN's own classification head output (auxiliary loss).
+        """
+        need_fmap = (self.memory_mode == "feature_map")
+        out = self.cnn(mz_features, precursor, glycan_type, rt, mode, lc, modification, trap,
+                      rep=True, return_feature_map=need_fmap)
+        class_logits, comb_rep = out[0], out[1]
+
+        if not need_fmap:
+            memory = self.rep_proj(comb_rep).unsqueeze(1)
+        else:
+            feature_map = out[2]                                          # (B, 102, 64)
+            tokens = self.fmap_proj(feature_map)                          # (B, 102, d)
+            pos = torch.arange(tokens.size(1), device=tokens.device)
+            tokens = tokens + self.fmap_pos_emb(pos).unsqueeze(0)
+            meta_cat = torch.cat([
+                self.cnn.prec_block(precursor),
+                self.cnn.type_emb(glycan_type).squeeze(1),
+                self.cnn.rt_block(rt),
+                self.cnn.mode_emb(mode).squeeze(1),
+                self.cnn.lc_emb(lc).squeeze(1),
+                self.cnn.modification_emb(modification).squeeze(1),
+                self.cnn.trap_emb(trap).squeeze(1),
+            ], dim=1)                                                     # (B, 168)
+            meta_token = self.meta_proj(meta_cat).unsqueeze(1)             # (B, 1, d)
+            memory = torch.cat([tokens, meta_token], dim=1)                # (B, 103, d)
+
+        return memory, None, class_logits
+
+    def decode_step(self, memory, tgt_input_ids, tgt_key_padding_mask=None, memory_key_padding_mask=None):
+        """memory: (B, S, d_model); tgt_input_ids: (B, T) Long -> logits (B, T, vocab_size)."""
+        batch_size, seq_len = tgt_input_ids.shape
+        positions = torch.arange(seq_len, device=tgt_input_ids.device)
+        tgt = self.tgt_tok_emb(tgt_input_ids) + self.tgt_pos_emb(positions).unsqueeze(0)
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(
+            seq_len, device=tgt_input_ids.device, dtype=torch.bool)
+        hidden = self.decoder(tgt=tgt, memory=memory, tgt_mask=causal_mask,
+                              tgt_key_padding_mask=tgt_key_padding_mask,
+                              memory_key_padding_mask=memory_key_padding_mask)
+        return self.fc_out(hidden)
+
+    def forward(self, mz_features, precursor, glycan_type, rt, mode, lc, modification, trap,
+                tgt_input_ids=None, tgt_key_padding_mask=None):
+        """Returns (token_logits, class_logits). token_logits is None if tgt_input_ids is None
+        (encode-only path)."""
+        memory, memory_key_padding_mask, class_logits = self.encode(
+            mz_features, precursor, glycan_type, rt, mode, lc, modification, trap)
+        if tgt_input_ids is None:
+            return None, class_logits
+        token_logits = self.decode_step(memory, tgt_input_ids, tgt_key_padding_mask, memory_key_padding_mask)
+        return token_logits, class_logits
+
+
 #########################################################################################################
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-8):
@@ -549,21 +698,8 @@ class CandyCrunch_Transformer(nn.Module):
                                       make_norm(norm_type, metadata_dim),
                                       make_activation(activation))
 
-        # Decoder components
-        self.vocab_size = num_classes
-        self.tgt_tok_emb = nn.Embedding(self.vocab_size, peak_hidden_dim)
-        self.tgt_pos_emb = nn.Embedding(1024, peak_hidden_dim)
-        self.meta_proj = nn.Linear(7 * metadata_dim, peak_hidden_dim)
-
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=peak_hidden_dim, nhead=heads, dim_feedforward=ff_dim,
-            dropout=dropout, batch_first=True, activation=encoder_activation
-        )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=layers)
-        self.fc_out = nn.Linear(peak_hidden_dim, self.vocab_size)
-        #############
-        """
         combined_dim = peak_hidden_dim + 7 * metadata_dim
+
         self.classifier_rep = nn.Sequential(nn.Linear(combined_dim, 1024),
                                             make_norm(norm_type, 1024),
                                             make_activation(activation),
@@ -572,8 +708,9 @@ class CandyCrunch_Transformer(nn.Module):
                                             make_norm(norm_type, 512),
                                             make_activation(activation),
                                             nn.Dropout(dropout))
+
         self.classifier_out = nn.Linear(512, num_classes)
-        """
+
     def encode_mz(self, mz):
         half_dim = self.mz_encoding_dim // 2
         wavelengths = (self.lambda_min * (self.lambda_max / self.lambda_min) **
@@ -599,9 +736,7 @@ class CandyCrunch_Transformer(nn.Module):
         if aux_loss is None:
             return torch.tensor(0.0, device=self.cls_token.device, dtype=self.cls_token.dtype)
         return aux_loss
-    # Changed for decoder
-    def forward(self, peak_list, peak_padding_mask, precursor, glycan_type, rt, mode, lc, modification, trap,
-                tgt_input_ids=None, tgt_key_padding_mask=None, tgt_mask=None):
+    def forward(self, peak_list, peak_padding_mask, precursor, glycan_type, rt, mode, lc, modification, trap, rep=False):
         batch_size = peak_list.size(0)
         peak_features = self.make_peak_embedding(peak_list)
         if self.use_resunits:
@@ -611,6 +746,7 @@ class CandyCrunch_Transformer(nn.Module):
         cls_padding = torch.zeros(batch_size, 1, dtype=torch.bool, device=peak_padding_mask.device)
         transformer_padding_mask = torch.cat([cls_padding, peak_padding_mask], dim=1)
         peak_features = self.transformer(peak_features,src_key_padding_mask=transformer_padding_mask)
+        spectrum_rep = peak_features[:, 0, :]
         glycan_type = self.type_emb(glycan_type).squeeze(1)
         mode = self.mode_emb(mode).squeeze(1)
         lc = self.lc_emb(lc).squeeze(1)
@@ -618,29 +754,9 @@ class CandyCrunch_Transformer(nn.Module):
         trap = self.trap_emb(trap).squeeze(1)
         precursor = self.prec_block(precursor)
         rt = self.rt_block(rt)
-        """
         comb = torch.cat([spectrum_rep, precursor, glycan_type, rt, mode, lc, modification, trap], dim=1)
         comb_rep = self.classifier_rep(comb)
         comb = self.classifier_out(comb_rep)
         if rep:
             return comb, comb_rep
         return comb
-        """
-        meta_cat = torch.cat([precursor, glycan_type, rt, mode, lc, modification, trap], dim=1)
-        meta_token = self.meta_proj(meta_cat).unsqueeze(1)
-        memory = torch.cat([peak_features, meta_token], dim=1)
-        meta_padding = torch.zeros(batch_size, 1, dtype=torch.bool, device=peak_padding_mask.device)
-        memory_key_padding_mask = torch.cat([transformer_padding_mask, meta_padding], dim=1)
-        seq_len = tgt_input_ids.size(1)
-        if tgt_mask is None:
-            tgt_mask = nn.Transformer.generate_square_subsequent_mask(seq_len, device=tgt_input_ids.device, dtype=torch.bool)
-        positions = torch.arange(seq_len, device=tgt_input_ids.device).unsqueeze(0).expand(batch_size, seq_len)
-        tgt_emb = self.tgt_tok_emb(tgt_input_ids) + self.tgt_pos_emb(positions)
-        out = self.decoder(
-            tgt=tgt_emb,
-            memory=memory,
-            tgt_mask=tgt_mask,
-            tgt_key_padding_mask=tgt_key_padding_mask,
-            memory_key_padding_mask=memory_key_padding_mask
-        )
-        return self.fc_out(out)
