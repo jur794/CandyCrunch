@@ -44,74 +44,6 @@ def calculate_class_distribution(dataloader, num_classes):
     return class_counts, total_samples
 
 
-# def prepare_batch(data, model_type):
-#     (
-#         mz_list,
-#         peak_list,
-#         mz_remainder,
-#         precursor,
-#         glycan_type,
-#         rt,
-#         mode_in,
-#         lc,
-#         modification,
-#         trap,
-#         y,
-#     ) = data
-#
-#     precursor = precursor.to(device)
-#     glycan_type = glycan_type.to(device)
-#     rt = rt.to(device)
-#     mode_in = mode_in.to(device)
-#     lc = lc.to(device)
-#     modification = modification.to(device)
-#     trap = trap.to(device)
-#     y = y.squeeze().to(device)
-#
-#     if model_type == "CNN":
-#         mz_features = torch.stack([mz_list, mz_remainder], dim=1).to(device)
-#
-#         inputs = [
-#             mz_features,
-#             precursor,
-#             glycan_type,
-#             rt,
-#             mode_in,
-#             lc,
-#             modification,
-#             trap,
-#         ]
-#
-#     elif model_type == "Transformer":
-#         peak_list = peak_list.to(device)
-#
-#         # Padding rows are expected to be [0.0, 0.0].
-#         # True means "ignore this peak" for Transformer masks.
-#         # For case [0.0, 0.0]
-#         peak_padding_mask = peak_list.abs().sum(dim=-1) == 0
-#         # For case [0.0]
-#         # peak_padding_mask = peak_list.squeeze(-1) < 0
-#
-#         inputs = [
-#             peak_list,
-#             peak_padding_mask,
-#             precursor,
-#             glycan_type,
-#             rt,
-#             mode_in,
-#             lc,
-#             modification,
-#             trap,
-#         ]
-#
-#     else:
-#         raise ValueError(
-#             f"Unknown model_type={model_type!r}. Expected 'cnn' or 'transformer'."
-#         )
-#
-#     return inputs, y
-
-
 def prepare_batch(data, model_type):
 
     if model_type == "CNN":
@@ -144,35 +76,7 @@ def prepare_batch(data, model_type):
 
         y = y.squeeze().to(device)
 
-    elif model_type == "Transformer":
-        (
-            peak_list,
-            peak_padding_mask,
-            precursor,
-            glycan_type,
-            rt,
-            mode_in,
-            lc,
-            modification,
-            trap,
-            y,
-        ) = data
-
-        inputs = [
-            peak_list.to(device),
-            peak_padding_mask.to(device),
-            precursor.to(device),
-            glycan_type.to(device),
-            rt.to(device),
-            mode_in.to(device),
-            lc.to(device),
-            modification.to(device),
-            trap.to(device),
-        ]
-
-        y = y.squeeze().to(device)
-
-    elif model_type == "CNN_Decoder":
+    elif model_type in {"Transformer", "CNN_Decoder"}:
         (
             mz_list,
             peak_list,
@@ -190,10 +94,10 @@ def prepare_batch(data, model_type):
             target_labels,
         ) = data
 
-        mz_features = torch.stack([mz_list, mz_remainder], dim=1).to(device)
-
+        spectrum = (torch.stack([mz_list, mz_remainder], dim=1)
+                    if model_type == "CNN_Decoder" else peak_list)
         inputs = [
-            mz_features,
+            spectrum.to(device),
             precursor.to(device),
             glycan_type.to(device),
             rt.to(device),
@@ -621,8 +525,9 @@ def train_model(model, dataloaders, criterion, optimizer,
 def train_decoder_model(model, dataloaders, optimizer, scheduler, pad_token_id, vocab_size,
                         class_criterion=None, class_loss_weight=0.0, num_epochs=None, patience=None,
                         log_to_wandb=True, model_type="CNN_Decoder", setting_name=None,
-                        checkpoint_metadata=None, label_smoothing=0.1, log_prefix=""):
-    """trains CandyCrunch_CNN_Decoder to autoregressively generate IUPAC token sequences
+                        checkpoint_metadata=None, label_smoothing=0.1, moe_aux_loss_weight=None,
+                        log_prefix=""):
+    """Trains a CNN or peak-list Transformer decoder to generate IUPAC tokens.
 
     Mirrors train_model's epoch/early-stopping/checkpoint/plotting scaffolding (same SAM
     two-forward-pass optimizer pattern, same output file conventions), but loss/metrics operate
@@ -631,7 +536,7 @@ def train_decoder_model(model, dataloaders, optimizer, scheduler, pad_token_id, 
 
     Arguments:
     :-
-    model (PyTorch object): CandyCrunch_CNN_Decoder
+    model (PyTorch object): CandyCrunch_CNN_Decoder or CandyCrunch_Transformer
     dataloaders (PyTorch object): dictionary of dataloader objects with keys 'train' and 'val'
     optimizer (PyTorch object): SAM-style optimizer with first_step/second_step
     scheduler (PyTorch object): PyTorch learning rate decay
@@ -656,6 +561,10 @@ def train_decoder_model(model, dataloaders, optimizer, scheduler, pad_token_id, 
     train_losses, train_token_acc = [], []
 
     token_criterion = nn.CrossEntropyLoss(ignore_index = pad_token_id, label_smoothing = label_smoothing)
+    model_for_aux = model.module if hasattr(model, "module") else model
+
+    def unpack_output(output):
+        return output if isinstance(output, tuple) else (output, None)
 
     def compute_loss(token_logits, class_logits, target_labels, y_class):
         loss = token_criterion(token_logits.reshape(-1, vocab_size), target_labels.reshape(-1))
@@ -698,8 +607,10 @@ def train_decoder_model(model, dataloaders, optimizer, scheduler, pad_token_id, 
 
                 with torch.set_grad_enabled(phase == 'train'):
                     enable_running_stats(model)
-                    token_logits, class_logits = model(*inputs)
+                    token_logits, class_logits = unpack_output(model(*inputs))
                     loss, _ = compute_loss(token_logits, class_logits, target_labels, y_class)
+                    if moe_aux_loss_weight is not None and hasattr(model_for_aux, "get_aux_loss"):
+                        loss = loss + moe_aux_loss_weight * model_for_aux.get_aux_loss()
 
                     if phase == 'train':
                         loss.backward()
@@ -707,8 +618,10 @@ def train_decoder_model(model, dataloaders, optimizer, scheduler, pad_token_id, 
 
                         # second forward pass for SAM
                         disable_running_stats(model)
-                        token_logits2, class_logits2 = model(*inputs)
+                        token_logits2, class_logits2 = unpack_output(model(*inputs))
                         loss2, _ = compute_loss(token_logits2, class_logits2, target_labels, y_class)
+                        if moe_aux_loss_weight is not None and hasattr(model_for_aux, "get_aux_loss"):
+                            loss2 = loss2 + moe_aux_loss_weight * model_for_aux.get_aux_loss()
                         loss2.backward()
                         optimizer.second_step(zero_grad = True)
 
@@ -902,7 +815,7 @@ def _calibrated_beam_probs(row_conf, temperature):
 def calibrate_decoder_checkpoint(checkpoint_path, val_dataloader, val_true_glycans, glycan_class,
                                  tokenizer, k=25, length_penalty=0.7,
                                  pred_thresh_grid=None, extra_thresh_grid=None):
-    """calibrates a trained CandyCrunch_CNN_Decoder checkpoint on a held-out validation set
+    """Calibrates a trained generative checkpoint on a held-out validation set.
 
     Runs beam search once (temperature=1.0) on the val set, fits a single scalar temperature via
     fit_beam_temperature, and sweeps a small pred_thresh x extra_thresh grid mirroring
@@ -914,7 +827,7 @@ def calibrate_decoder_checkpoint(checkpoint_path, val_dataloader, val_true_glyca
 
     Arguments:
     :-
-    checkpoint_path (str): path to a CandyCrunch_CNN_Decoder .pt checkpoint (updated in place)
+    checkpoint_path (str): path to a CNN decoder or Transformer .pt checkpoint (updated in place)
     val_dataloader (PyTorch): dataloader from process_for_inference over the held-out val split
     val_true_glycans (list[str]): ground-truth IUPAC string per row of val_dataloader, same order
     glycan_class (str): glycan class as used by glycowork's enforce_class ("O", "N", "lipid", "free")

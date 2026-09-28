@@ -144,7 +144,8 @@ def posthoc_process_df(df_in, posthoc_params):
 
 extra_param_dict = {
         'test_dict': TEST_DICTS,
-        'model': ['CNN', 'Transformer'],
+        # The old Transformer checkpoint is a classifier; generative inference needs a new checkpoint.
+        'model': ['CNN'],
         'supplement': [True],
         'experimental': [True]
     }

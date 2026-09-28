@@ -24,7 +24,7 @@ from glycowork.network.biosynthesis import construct_network, evoprune_network
 from pyteomics import mzxml
 from glycowork.motif.processing import canonicalize_iupac
 from candycrunch.model import (CandyCrunch_CNN, CandyCrunch_Transformer, CandyCrunch_CNN_Decoder,
-                               SimpleDataset, TransDataset, SeqSimpleDataset, transform_mz, transform_rt)
+                               SimpleDataset, transform_mz, transform_rt)
 from candycrunch.BPETokenizer import BPETokenizer
 from candycrunch.analysis import CandyCrumbs
 
@@ -48,7 +48,6 @@ MODEL_DIR = "/home/jurriaan/CandyCrunch_test/CandyCrunch/training/models"
 
 DEFAULT_MODEL_PATHS = {
     "CNN": os.path.join(MODEL_DIR, "CandyCrunch_CNN_GShS_DSS4.0.pt"),
-    "Transformer": os.path.join(MODEL_DIR, "CandyCrunch_Transformer_DENSE_GShS_H4L2FFD512MP512_PE(fourier)_N(rms)_ACT(leaky_relu)_RU(False)_org.pt"),
     "CNN_Decoder": os.path.join(MODEL_DIR, "CandyCrunch_CNNDec.pt"),
 }
 
@@ -72,7 +71,7 @@ def _resolve_model_path(model):
         return DEFAULT_MODEL_PATHS["CNN"]
 
     if model_key.lower() == "transformer":
-        return DEFAULT_MODEL_PATHS["Transformer"]
+        raise ValueError("Pass the path to a trained generative Transformer checkpoint.")
 
     if model_key.lower() in {"cnn_decoder", "cnndecoder"}:
         return DEFAULT_MODEL_PATHS["CNN_Decoder"]
@@ -81,7 +80,7 @@ def _resolve_model_path(model):
         return model_key
 
     raise ValueError(
-        f"Unknown model={model!r}. Use 'CNN', 'Transformer', or a checkpoint path."
+        f"Unknown model={model!r}. Use 'CNN', 'CNN_Decoder', or a checkpoint path."
     )
 
 
@@ -130,6 +129,12 @@ def load_checkpoint_model(checkpoint_path):
 
     model_class_name = checkpoint["model_class"]
     model_kwargs = dict(checkpoint["model_kwargs"])
+
+    if model_class_name == "CandyCrunch_Transformer" and "vocab_size" not in model_kwargs:
+        raise ValueError(
+            "This checkpoint contains the old classification Transformer. "
+            "Train a generative Transformer checkpoint before using it for inference."
+        )
 
     if model_class_name not in MODEL_CLASSES:
         raise ValueError(
@@ -200,12 +205,14 @@ MODEL_INFERENCE_DEFAULTS = {
         "augment_rt": True,
     },
     "Transformer": {
-        "temperature": temperature,
+        "temperature": torch.Tensor([1.0]).to(device),
         "pred_thresh": 0.01,
         "extra_thresh": 0.2,
-        "test_time_copies": 5,
+        "test_time_copies": 1,
         "augment_mz": False,
         "augment_rt": False,
+        "beam_width": 25,
+        "length_penalty": 0.7,
     },
     "CNN_Decoder": {
         "temperature": torch.Tensor([1.0]).to(device),
@@ -507,12 +514,10 @@ def process_for_inference(df, glycan_class, mode='negative', modification='reduc
     mz_transform = transform_mz if augment_mz else None
     rt_transform = transform_rt if augment_rt else None
 
-    if model_name == 'Transformer':
-        dset = TransDataset(X, y, transform_rt=rt_transform)
-    else:
-        dset = SimpleDataset(X, y, transform_mz=mz_transform, transform_rt=rt_transform)
+    dset = SimpleDataset(X, y, transform_mz=mz_transform, transform_rt=rt_transform)
 
-    dloader = torch.utils.data.DataLoader(dset, batch_size=256, shuffle=False)
+    batch_size = 8 if model_name == "Transformer" else 256
+    dloader = torch.utils.data.DataLoader(dset, batch_size=batch_size, shuffle=False)
 
     idx_col = 'm/z' if 'm/z' in df.columns else 'reducing_mass'
     df.set_index(idx_col, inplace=True)
@@ -540,23 +545,19 @@ def get_topk(dataloader, model, glycans=None, k= 25, temp= False, temperature= t
    | (2) a nested list of associated prediction confidences, for each spectrum
    """
     model = get_model(model)
+    if _canonical_model_name(model) != "CNN":
+        raise ValueError("get_topk supports CNN classifiers only; use beam_search_topk for generative models.")
     if glycans is None:
         glycans = getattr(model, "_candycrunch_glycans", globals()["glycans"])
-    model_name = _canonical_model_name(model)
     n_samples = len(dataloader.dataset)
     preds = np.empty((n_samples, k), dtype=int)
     conf = np.empty((n_samples, k), dtype=float)
     start_idx = 0
     for data in dataloader:
-        if model_name == 'Transformer':
-            peak_list, peak_padding_mask, precursor, glycan_type, rt, mode, lc, modification, trap, y = data
-            batch_size = len(y)
-            inputs = [peak_list, peak_padding_mask, precursor, glycan_type, rt, mode, lc, modification, trap]
-        else:
-            mz_list, peak_list, mz_remainder, precursor, glycan_type, rt, mode, lc, modification, trap, y = data
-            mz_list = torch.stack([mz_list, mz_remainder], dim=1)
-            batch_size = len(y)
-            inputs = [mz_list, precursor, glycan_type, rt, mode, lc, modification, trap]
+        mz_list, peak_list, mz_remainder, precursor, glycan_type, rt, mode, lc, modification, trap, y = data
+        mz_list = torch.stack([mz_list, mz_remainder], dim=1)
+        batch_size = len(y)
+        inputs = [mz_list, precursor, glycan_type, rt, mode, lc, modification, trap]
         inputs = [x.to(device) for x in inputs]
         pred = model(*inputs)
         if temp:
@@ -586,13 +587,13 @@ def _safe_canonicalize(iupac_string):
 def beam_search_topk(dataloader, model, tokenizer=None, k=25, max_length=None,
                      length_penalty=0.7, temperature=None, return_discard_rate=False):
     """autoregressively beam-searches topk IUPAC-condensed glycan strings for spectra in dataloader
-    (CandyCrunch_CNN_Decoder only). Shape-identical return to get_topk, so wrap_inference's
+    using either generative model. Shape-identical return to get_topk, so wrap_inference's
     downstream code (composition filter, CandyCrumbs, biosynthesis-network supplementation,
     canonicalize_biosynthesis, GlyTouCan mapping) runs unchanged.\n
    | Arguments:
    | :-
-   | dataloader (PyTorch): dataloader from process_for_inference (CNN_Decoder -> SimpleDataset features)
-   | model (PyTorch): trained CandyCrunch_CNN_Decoder model
+   | dataloader (PyTorch): dataloader from process_for_inference (SimpleDataset features)
+   | model (PyTorch): trained CandyCrunch_CNN_Decoder or CandyCrunch_Transformer
    | tokenizer (BPETokenizer): tokenizer the model's decoder was trained with; default: the one
    |                           stored on the checkpoint (model._candycrunch_tokenizer)
    | k (int): beam width / number of candidates to return per spectrum; default:25
@@ -609,8 +610,8 @@ def beam_search_topk(dataloader, model, tokenizer=None, k=25, max_length=None,
    """
     model = get_model(model)
     model_name = _canonical_model_name(model)
-    if model_name != 'CNN_Decoder':
-        raise ValueError("beam_search_topk only supports CandyCrunch_CNN_Decoder; use get_topk for CNN/Transformer.")
+    if model_name not in {'CNN_Decoder', 'Transformer'}:
+        raise ValueError("beam_search_topk supports generative models only; use get_topk for CNN.")
 
     if tokenizer is None:
         tokenizer = getattr(model, "_candycrunch_tokenizer", None)
@@ -620,7 +621,10 @@ def beam_search_topk(dataloader, model, tokenizer=None, k=25, max_length=None,
             "checkpoint that has one stored (see training_script.py's checkpoint_metadata)."
         )
     if max_length is None:
-        max_length = getattr(model, "_candycrunch_target_len", None) or tokenizer.max_seq_length
+        max_length = (getattr(model, "_candycrunch_target_len", None)
+                      or model.tgt_pos_emb.num_embeddings)
+    if max_length > model.tgt_pos_emb.num_embeddings:
+        raise ValueError("max_length exceeds the decoder's positional embedding length.")
     if temperature is None:
         temperature = 1.0
     if torch.is_tensor(temperature):
@@ -636,11 +640,13 @@ def beam_search_topk(dataloader, model, tokenizer=None, k=25, max_length=None,
     with torch.no_grad():
         for data in dataloader:
             mz_list, peak_list, mz_remainder, precursor, glycan_type, rt, mode, lc, modification, trap, y = data
-            mz_features = torch.stack([mz_list, mz_remainder], dim=1).to(device)
-            enc_inputs = [mz_features, precursor.to(device), glycan_type.to(device), rt.to(device),
+            spectrum = (peak_list if model_name == 'Transformer'
+                        else torch.stack([mz_list, mz_remainder], dim=1)).to(device)
+            enc_inputs = [spectrum, precursor.to(device), glycan_type.to(device), rt.to(device),
                          mode.to(device), lc.to(device), modification.to(device), trap.to(device)]
 
-            memory, mem_mask, _ = model.encode(*enc_inputs)
+            encoded = model.encode(*enc_inputs)
+            memory, mem_mask = encoded[:2]
             batch_size = memory.size(0)
 
             memory = memory.repeat_interleave(k, dim=0)
@@ -2079,7 +2085,7 @@ def wrap_inference(spectra_filepath, glycan_class, model= candycrunch, glycans=N
         model = model,
     )
     # Predict glycans from spectra
-    if model_name == 'CNN_Decoder':
+    if model_name in {'CNN_Decoder', 'Transformer'}:
         preds, pred_conf = beam_search_topk(
             loader, model,
             tokenizer = getattr(model, "_candycrunch_tokenizer", None),

@@ -94,8 +94,8 @@ class SimpleDataset(torch.utils.data.Dataset):
 
 class SeqSimpleDataset(SimpleDataset):
     """SimpleDataset (CNN-style features + augmentation) plus BPE-tokenized decoder
-    targets, for training CandyCrunch_CNN_Decoder. Keeps the integer class label
-    (y_class) around too, for the optional auxiliary classification loss.
+    targets, for training either generative model. Keeps the integer class label
+    (y_class) for the CNN decoder's optional auxiliary classification loss.
 
     y_class: list[int]  -- glycans.index(...) labels, same as SimpleDataset's `y`
     y_str:   list[str]  -- raw IUPAC strings, tokenized once here at construction
@@ -121,49 +121,6 @@ class SeqSimpleDataset(SimpleDataset):
         target_labels = tgt[1:].clone()
         tgt_key_padding_mask = (decoder_input_ids == self.pad_id)
         return base + (decoder_input_ids, tgt_key_padding_mask, target_labels)
-
-
-class TransDataset(torch.utils.data.Dataset):
-
-    def __init__(self, x, y, transform_rt=None):
-        self.x = x
-        self.y = y
-        self.transform_rt = transform_rt
-
-    def __len__(self):
-        return len(self.x)
-
-    def __getitem__(self, index):
-        peak_list = self.x[index][1]
-        prec = self.x[index][3]
-        glycan_type = self.x[index][4]
-        RT = self.x[index][5]
-        mode = self.x[index][6]
-        lc = self.x[index][7]
-        modification = self.x[index][8]
-        trap = self.x[index][9]
-        out = self.y[index]
-
-        if self.transform_rt:
-            RT = self.transform_rt(RT)
-
-        peak_list = torch.FloatTensor(peak_list)
-
-        # True means "ignore this token" for PyTorch Transformer padding masks.
-        peak_padding_mask = peak_list.abs().sum(dim=-1) == 0
-
-        return (
-            peak_list,
-            peak_padding_mask,
-            torch.FloatTensor(prec),
-            torch.LongTensor([glycan_type]),
-            torch.FloatTensor([RT]),
-            torch.LongTensor([mode]),
-            torch.LongTensor([lc]),
-            torch.LongTensor([modification]),
-            torch.LongTensor([trap]),
-            torch.LongTensor([out]),
-        )
 
 
 class PeakResBlock(nn.Module):
@@ -605,12 +562,16 @@ class CandyTransformerEncoder(nn.Module):
 
 
 class CandyCrunch_Transformer(nn.Module):
-    def __init__(self, num_classes=None, input_precursor_dim=None, heads=None, layers=None, ff_dim=None, peak_dim=2,
+    """Encode a peak list and autoregressively decode an IUPAC token sequence."""
+
+    def __init__(self, vocab_size, input_precursor_dim=None, heads=None, layers=None, ff_dim=None, peak_dim=2,
                  metadata_dim=24, dropout=0.2, peak_encoder="linear", encoder_type="dense",
                  norm_type="layer", activation="leaky_relu", encoder_activation="gelu", peak_hidden_dim=None,
                  lambda_min=10 ** -2.5, lambda_max=10 ** 3.3, use_resunits=False, res_kernel_size=3,
                  res_dilations=(1, 2, 4, 8), res_causal=False, num_experts=4, moe_top_k=2,
-                 norm_first=True, encoder_final_norm=True):
+                 norm_first=True, encoder_final_norm=True, d_model=256, dec_heads=8, dec_layers=3,
+                 dec_ff_dim=1024, dec_dropout=0.1, max_target_len=512,
+                 pad_token_id=0, bos_token_id=1, eos_token_id=2):
         super().__init__()
 
         if ff_dim is None or heads is None or layers is None:
@@ -630,6 +591,10 @@ class CandyCrunch_Transformer(nn.Module):
         self.use_resunits = use_resunits
         self.lambda_min = lambda_min
         self.lambda_max = lambda_max
+        self.vocab_size = vocab_size
+        self.pad_token_id = pad_token_id
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
 
         if peak_encoder == "linear":
             self.peak_projection = nn.Sequential( nn.Linear(peak_dim, peak_hidden_dim),
@@ -698,18 +663,16 @@ class CandyCrunch_Transformer(nn.Module):
                                       make_norm(norm_type, metadata_dim),
                                       make_activation(activation))
 
-        combined_dim = peak_hidden_dim + 7 * metadata_dim
-
-        self.classifier_rep = nn.Sequential(nn.Linear(combined_dim, 1024),
-                                            make_norm(norm_type, 1024),
-                                            make_activation(activation),
-                                            nn.Dropout(dropout),
-                                            nn.Linear(1024, 512),
-                                            make_norm(norm_type, 512),
-                                            make_activation(activation),
-                                            nn.Dropout(dropout))
-
-        self.classifier_out = nn.Linear(512, num_classes)
+        self.memory_proj = nn.Linear(peak_hidden_dim, d_model)
+        self.meta_proj = nn.Linear(7 * metadata_dim, d_model)
+        self.tgt_tok_emb = nn.Embedding(vocab_size, d_model, padding_idx=pad_token_id)
+        self.tgt_pos_emb = nn.Embedding(max_target_len, d_model)
+        decoder_layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=dec_heads,
+                                                   dim_feedforward=dec_ff_dim, dropout=dec_dropout,
+                                                   batch_first=True, activation="gelu", norm_first=True)
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=dec_layers,
+                                             norm=nn.LayerNorm(d_model))
+        self.fc_out = nn.Linear(d_model, vocab_size)
 
     def encode_mz(self, mz):
         half_dim = self.mz_encoding_dim // 2
@@ -736,8 +699,9 @@ class CandyCrunch_Transformer(nn.Module):
         if aux_loss is None:
             return torch.tensor(0.0, device=self.cls_token.device, dtype=self.cls_token.dtype)
         return aux_loss
-    def forward(self, peak_list, peak_padding_mask, precursor, glycan_type, rt, mode, lc, modification, trap, rep=False):
+    def encode(self, peak_list, precursor, glycan_type, rt, mode, lc, modification, trap):
         batch_size = peak_list.size(0)
+        peak_padding_mask = peak_list.abs().sum(dim=-1) == 0
         peak_features = self.make_peak_embedding(peak_list)
         if self.use_resunits:
             peak_features = self.peak_res_block(peak_features,peak_padding_mask=peak_padding_mask)
@@ -746,7 +710,6 @@ class CandyCrunch_Transformer(nn.Module):
         cls_padding = torch.zeros(batch_size, 1, dtype=torch.bool, device=peak_padding_mask.device)
         transformer_padding_mask = torch.cat([cls_padding, peak_padding_mask], dim=1)
         peak_features = self.transformer(peak_features,src_key_padding_mask=transformer_padding_mask)
-        spectrum_rep = peak_features[:, 0, :]
         glycan_type = self.type_emb(glycan_type).squeeze(1)
         mode = self.mode_emb(mode).squeeze(1)
         lc = self.lc_emb(lc).squeeze(1)
@@ -754,9 +717,24 @@ class CandyCrunch_Transformer(nn.Module):
         trap = self.trap_emb(trap).squeeze(1)
         precursor = self.prec_block(precursor)
         rt = self.rt_block(rt)
-        comb = torch.cat([spectrum_rep, precursor, glycan_type, rt, mode, lc, modification, trap], dim=1)
-        comb_rep = self.classifier_rep(comb)
-        comb = self.classifier_out(comb_rep)
-        if rep:
-            return comb, comb_rep
-        return comb
+        metadata = torch.cat([precursor, glycan_type, rt, mode, lc, modification, trap], dim=1)
+        memory = torch.cat([self.memory_proj(peak_features), self.meta_proj(metadata).unsqueeze(1)], dim=1)
+        memory_padding_mask = torch.cat([transformer_padding_mask, cls_padding], dim=1)
+        return memory, memory_padding_mask
+
+    def decode_step(self, memory, tgt_input_ids, tgt_key_padding_mask=None, memory_key_padding_mask=None):
+        seq_len = tgt_input_ids.size(1)
+        positions = torch.arange(seq_len, device=tgt_input_ids.device)
+        tgt = self.tgt_tok_emb(tgt_input_ids) + self.tgt_pos_emb(positions).unsqueeze(0)
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(
+            seq_len, device=tgt_input_ids.device, dtype=torch.bool)
+        hidden = self.decoder(tgt=tgt, memory=memory, tgt_mask=causal_mask,
+                              tgt_key_padding_mask=tgt_key_padding_mask,
+                              memory_key_padding_mask=memory_key_padding_mask)
+        return self.fc_out(hidden)
+
+    def forward(self, peak_list, precursor, glycan_type, rt, mode, lc, modification, trap,
+                tgt_input_ids, tgt_key_padding_mask=None):
+        memory, memory_key_padding_mask = self.encode(
+            peak_list, precursor, glycan_type, rt, mode, lc, modification, trap)
+        return self.decode_step(memory, tgt_input_ids, tgt_key_padding_mask, memory_key_padding_mask)

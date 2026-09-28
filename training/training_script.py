@@ -1,6 +1,6 @@
 import pickle
 import pandas as pd
-from candycrunch.model import (SimpleDataset, TransDataset, CandyCrunch_CNN, transform_mz, transform_rt,
+from candycrunch.model import (SimpleDataset, CandyCrunch_CNN, transform_mz, transform_rt,
                                CandyCrunch_Transformer, CandyCrunch_CNN_Decoder, SeqSimpleDataset)
 from candycrunch.BPETokenizer import BPETokenizer
 from glycowork.motif.annotate import annotate_dataset, get_k_saccharides
@@ -54,6 +54,8 @@ def truncate_peak_lists(features, max_peaks = None):
 
 
 def main(args):
+    if args.model == "Transformer" and args.class_loss_weight > 0:
+        raise ValueError("--class_loss_weight requires CNN_Decoder; Transformer has no classification head.")
     set_seed(args.current_seed)
     print("Reading data")
     # Train and test data can be found on zenodo at https://doi.org/10.5281/zenodo.7940046
@@ -73,7 +75,7 @@ def main(args):
         glycans = glycans["glycan"].tolist()
 
     tokenizer = None
-    if args.model == "CNN_Decoder":
+    if args.model in {"CNN_Decoder", "Transformer"}:
         vocab_path = args.vocab_path or os.path.join(os.path.dirname(candycrunch.model.__file__), "bpe_vocab.json")
         tokenizer = BPETokenizer.load_vocabulary(vocab_path)
         print(f"Loaded BPE tokenizer from {vocab_path} (vocab_size={tokenizer.vocab_size})")
@@ -115,12 +117,10 @@ def main(args):
     if args.model == "CNN":
         trainset = SimpleDataset(X_train, y_train, transform_mz = transform_mz, transform_rt = transform_rt)
         valset = SimpleDataset(X_test, y_test)
-    elif args.model == "Transformer":
-        trainset = TransDataset(X_train, y_train, transform_rt = transform_rt)
-        valset = TransDataset(X_test, y_test)
-    elif args.model == "CNN_Decoder":
+    elif args.model in {"CNN_Decoder", "Transformer"}:
         trainset = SeqSimpleDataset(X_train, y_train, y_train_str, tokenizer,
-                                    transform_mz = transform_mz, transform_rt = transform_rt,
+                                    transform_mz = transform_mz if args.model == "CNN_Decoder" else None,
+                                    transform_rt = transform_rt,
                                     max_target_len = args.max_target_len)
         valset = SeqSimpleDataset(X_test, y_test, y_test_str, tokenizer, max_target_len = trainset.target_len)
         if args.overfit_n:
@@ -131,10 +131,11 @@ def main(args):
                                         max_target_len = trainset.target_len)
             valset = trainset
 
-    # --overfit_n makes the train/val sets tiny (e.g. 50 examples); the default batch_size=256
-    # with drop_last=True would then yield zero batches per epoch, so shrink to fit.
+    # Keep generative Transformer batches smaller because the decoder attends to every peak.
+    # Shrink tiny datasets to avoid dropping every batch.
     small_run = bool(getattr(args, "overfit_n", None))
-    loader_batch_size = min(256, len(trainset)) if small_run else 256
+    default_batch_size = 32 if args.model == "Transformer" else 256
+    loader_batch_size = min(default_batch_size, len(trainset))
     loader_drop_last = not small_run
 
     trainloader = torch.utils.data.DataLoader(
@@ -159,25 +160,26 @@ def main(args):
         prefetch_factor = 2,
     )
     dataloaders = {'train': trainloader, 'val': valloader}
-    print("Calculating composition/structure distance for loss")
     print(f"CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         print(f"GPU device name: {torch.cuda.get_device_name(0)}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    embs = annotate_dataset(glycans, feature_set = ['exhaustive'], condense = True)
-    embs2 = get_k_saccharides(glycans, size = 3)
-    embs2.index = glycans
-    embs = pd.concat([embs, embs2], axis = 1)
-    embs = embs.apply(pd.to_numeric, errors = 'coerce').fillna(0).astype(np.float32)
-    dist = pairwise_distances(embs, metric = 'cosine')
-    dist = dist * 1000 * 20
-    dist2 = torch.tensor(dist, requires_grad = True).to(device)
-    comps = [glycan_to_composition(k) for k in glycans]
-    comp_df = pd.DataFrame.from_dict(comps).fillna(0)
-    dist = pairwise_distances(comp_df, metric = 'cosine')
-    dist = dist * 1000 * 50
-    dist3 = torch.tensor(dist, requires_grad = True).to(device)
+    if args.model == "CNN" or (args.model == "CNN_Decoder" and args.class_loss_weight > 0):
+        print("Calculating composition/structure distance for loss")
+        embs = annotate_dataset(glycans, feature_set = ['exhaustive'], condense = True)
+        embs2 = get_k_saccharides(glycans, size = 3)
+        embs2.index = glycans
+        embs = pd.concat([embs, embs2], axis = 1)
+        embs = embs.apply(pd.to_numeric, errors = 'coerce').fillna(0).astype(np.float32)
+        dist = pairwise_distances(embs, metric = 'cosine')
+        dist = dist * 1000 * 20
+        dist2 = torch.tensor(dist, requires_grad = True).to(device)
+        comps = [glycan_to_composition(k) for k in glycans]
+        comp_df = pd.DataFrame.from_dict(comps).fillna(0)
+        dist = pairwise_distances(comp_df, metric = 'cosine')
+        dist = dist * 1000 * 50
+        dist3 = torch.tensor(dist, requires_grad = True).to(device)
     print("Preparing the model")
 
     if args.model == "CNN":
@@ -193,7 +195,7 @@ def main(args):
 
     elif args.model == "Transformer":
         model_kwargs = {
-            "num_classes": len(glycans),
+            "vocab_size": tokenizer.vocab_size,
             "input_precursor_dim": len(comp_vector_order),
             "heads": args.nheads,
             "layers": args.nlayers,
@@ -206,6 +208,15 @@ def main(args):
             "use_resunits": args.use_resunits,
             "num_experts": args.num_experts,
             "moe_top_k": args.moe_top_k,
+            "d_model": args.d_model,
+            "dec_heads": args.dec_heads,
+            "dec_layers": args.dec_layers,
+            "dec_ff_dim": args.dec_ff_dim,
+            "dec_dropout": args.dec_dropout,
+            "max_target_len": trainset.target_len,
+            "pad_token_id": tokenizer.vocab[tokenizer.special_tokens['pad_token']],
+            "bos_token_id": tokenizer.vocab[tokenizer.special_tokens['bos_token']],
+            "eos_token_id": tokenizer.vocab[tokenizer.special_tokens['eos_token']],
         }
 
         model = CandyCrunch_Transformer(**model_kwargs)
@@ -215,7 +226,8 @@ def main(args):
 
         setting_name = (f"{args.model}_{encoder_tag}_{args.split}_H{args.nheads}L{args.nlayers}FFD{args.ff_dim}"
                         f"MP{args.max_peaks}_PE({args.peak_encoder})_N({args.norm_type})_ACT({args.activation})"
-                        f"_RU({args.use_resunits})_{args.dataset}"
+                        f"_RU({args.use_resunits})_D{args.d_model}DL{args.dec_layers}DH{args.dec_heads}"
+                        f"_{args.dataset}"
                         )
 
     elif args.model == "CNN_Decoder":
@@ -243,16 +255,19 @@ def main(args):
                                                "glycan_type",
                                                "RT", "mode", "lc", "modification", "trap"],
                            "training_args": vars(args).copy()}
-    if args.model == "CNN_Decoder":
+    if args.model in {"CNN_Decoder", "Transformer"}:
         checkpoint_metadata["tokenizer_vocab"] = tokenizer.vocab
         checkpoint_metadata["tokenizer_merges"] = tokenizer.merges
         checkpoint_metadata["tokenizer_structural"] = sorted(tokenizer.structural)
         checkpoint_metadata["tokenizer_max_seq_length"] = tokenizer.max_seq_length
         checkpoint_metadata["target_len"] = trainset.target_len
-        checkpoint_metadata["pretrained_cnn_path"] = args.pretrained_cnn
+        if args.model == "CNN_Decoder":
+            checkpoint_metadata["pretrained_cnn_path"] = args.pretrained_cnn
         checkpoint_metadata["inference_defaults"] = {
             "temperature": 1.0, "pred_thresh": 0.01, "extra_thresh": 0.2,
-            "test_time_copies": 5, "augment_mz": True, "augment_rt": True,
+            "test_time_copies": 5 if args.model == "CNN_Decoder" else 1,
+            "augment_mz": args.model == "CNN_Decoder",
+            "augment_rt": args.model == "CNN_Decoder",
             "beam_width": 25, "length_penalty": 0.7,
         }
 
@@ -261,12 +276,12 @@ def main(args):
     model = model.apply(lambda module: init_weights(module, mode = 'kaiming'))
 
 
-    if args.model == "CNN_Decoder":
+    if args.model in {"CNN_Decoder", "Transformer"}:
         if args.resume_from:
             resume_ck = torch.load(args.resume_from, map_location = "cpu", weights_only = False)
             model.load_state_dict(_strip_module_prefix(resume_ck["state_dict"]))
-            print(f"Resumed CNN_Decoder weights from {args.resume_from}")
-        elif args.pretrained_cnn:
+            print(f"Resumed {args.model} weights from {args.resume_from}")
+        elif args.model == "CNN_Decoder" and args.pretrained_cnn:
             cnn_ck = model.load_pretrained_cnn(args.pretrained_cnn)
             assert list(cnn_ck["glycans"]) == list(glycans), "glycan label set mismatch with pretrained CNN"
             assert list(cnn_ck["comp_vector_order"]) == list(comp_vector_order), "comp_vector_order mismatch"
@@ -276,7 +291,7 @@ def main(args):
                 f"but this run uses dataset={args.dataset!r} split={args.split!r}. Validation spectra here may "
                 "have been training data for that encoder. Use the matching --dataset/--split.")
             print(f"Loaded pretrained CNN encoder from {args.pretrained_cnn}")
-        else:
+        elif args.model == "CNN_Decoder":
             print("WARNING: no --pretrained_cnn given; training the CNN encoder from scratch.")
 
     if torch.cuda.device_count() > 1:
@@ -286,16 +301,13 @@ def main(args):
     if args.model == "CNN":
         optimizer_ft, scheduler, criterion = training_setup(model, 0.0001, weight_decay = 0.00002,
                                                             num_classes = len(set(glycans)))
-    elif args.model == "Transformer":
-        optimizer_ft, scheduler, criterion = training_setup(model, 0.001, weight_decay = 0.000002,
-                                                            num_classes = len(set(glycans)))
-    elif args.model == "CNN_Decoder":
+    elif args.model in {"CNN_Decoder", "Transformer"}:
         optimizer_ft, scheduler, _ = training_setup(model, args.lr, weight_decay = 2e-5,
                                                     num_classes = tokenizer.vocab_size)
 
-    if args.model == "CNN_Decoder":
+    if args.model in {"CNN_Decoder", "Transformer"}:
         class_criterion = None
-        if args.class_loss_weight > 0:
+        if args.model == "CNN_Decoder" and args.class_loss_weight > 0:
             primary_loss = Poly1CrossEntropyLoss(num_classes = len(glycans), epsilon = 1, reduction = 'mean').to(device)
             class_criterion = custom_loss(primary_loss, dist2, dist3).to(device)
     else:
@@ -303,7 +315,7 @@ def main(args):
         criterion = custom_loss(primary_loss, dist2, dist3).to(device)
 
     print("Start training")
-    if args.model == "CNN_Decoder":
+    if args.model in {"CNN_Decoder", "Transformer"}:
         model_ft = train_decoder_model(
             model,
             dataloaders,
@@ -319,6 +331,7 @@ def main(args):
             setting_name = setting_name,
             checkpoint_metadata = checkpoint_metadata,
             label_smoothing = args.label_smoothing,
+            moe_aux_loss_weight = args.moe_aux_loss_weight,
             log_prefix = getattr(args, "log_prefix", ""))
     else:
         model_ft = train_model(
@@ -421,7 +434,7 @@ if __name__ == "__main__":
     parser.add_argument("--pretrained_cnn", type = str, default = None,
                         help = "Path to an existing CandyCrunch_CNN_*.pt checkpoint to load as the encoder.")
     parser.add_argument("--lr", type = float, default = 1e-4,
-                        help = "Single learning rate for CNN_Decoder (encoder + decoder trained jointly).")
+                        help = "Learning rate for generative models (encoder and decoder trained jointly).")
     parser.add_argument("--memory_mode", type = str, default = "simple", choices = ["simple", "feature_map"],
                         help = "Decoder memory: single penultimate vector, or the pre-pool conv feature map.")
     parser.add_argument("--d_model", type = int, default = 256)
@@ -436,7 +449,7 @@ if __name__ == "__main__":
                         help = "Use only the first N train examples (as both train and val, no augmentation) "
                               "for the overfit-gate sanity check.")
     parser.add_argument("--resume_from", type = str, default = None,
-                        help = "Resume a CNN_Decoder checkpoint (its full state_dict, encoder+decoder).")
+                        help = "Resume a generative model checkpoint (its full state_dict, encoder and decoder).")
     parser.add_argument("--vocab_path", type = str, default = None,
                         help = "Path to a saved BPETokenizer vocab; default <candycrunch dir>/bpe_vocab.json.")
     parser.add_argument("--max_target_len", type = int, default = None)
