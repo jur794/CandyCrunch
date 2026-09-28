@@ -290,7 +290,7 @@ class custom_loss(torch.nn.Module):
 
 def train_model(model, dataloaders, criterion, optimizer,
                 scheduler, glycans, num_epochs = None, patience = None, log_to_wandb = True, num_classes = None,
-                model_type = None, setting_name = None, moe_aux_loss_weight=None,checkpoint_metadata=None):
+                model_type = None, setting_name = None, moe_aux_loss_weight=None,checkpoint_metadata=None, log_prefix = ""):
     """trains a deep learning model on predicting glycan properties
 
     Arguments:
@@ -310,6 +310,7 @@ def train_model(model, dataloaders, criterion, optimizer,
     Returns the best model seen during training
     """
     since = time.time()
+    _wlog = lambda metrics: wandb.log({log_prefix + k: v for k, v in metrics.items()})
     early_stopping = EarlyStopping(patience = patience, verbose = True)
     best_model_wts = copy.deepcopy(model.state_dict())
     best_loss = 100.0
@@ -352,7 +353,7 @@ def train_model(model, dataloaders, criterion, optimizer,
     if log_to_wandb:
         train_class_counts, train_total = calculate_class_distribution(dataloaders['train'], num_classes)
 
-        wandb.log({
+        _wlog({
             "dataset_stats/train_samples": train_total,
             "dataset_stats/val_samples": val_total,
             "dataset_stats/train_classes_present": np.sum(train_class_counts > 0),
@@ -371,7 +372,7 @@ def train_model(model, dataloaders, criterion, optimizer,
 
         if top_classes_data:
             class_table = wandb.Table(data = top_classes_data, columns = ["Class", "Train Count"])
-            wandb.log({"top_20_classes": class_table})
+            _wlog({"top_20_classes": class_table})
 
     for epoch in range(num_epochs):
         print('Epoch {}/{}'.format(epoch, num_epochs - 1))
@@ -499,7 +500,7 @@ def train_model(model, dataloaders, criterion, optimizer,
 
             # Log to wandb
             if log_to_wandb:
-                wandb.log({
+                _wlog({
                     f'{phase}/loss': epoch_loss,
                     f'{phase}/accuracy': epoch_acc,
                     f'{phase}/mcc': epoch_mcc_final,
@@ -603,7 +604,7 @@ def train_model(model, dataloaders, criterion, optimizer,
 
     # Log final plots/model to wandb
     if log_to_wandb:
-        wandb.log({
+        _wlog({
             'training_plots/loss_curves': wandb.Image(plot_path),
             'best_metrics/best_val_loss': best_loss,
             'best_metrics/best_val_accuracy': best_acc.item() if hasattr(best_acc, 'item') else best_acc,
@@ -620,7 +621,7 @@ def train_model(model, dataloaders, criterion, optimizer,
 def train_decoder_model(model, dataloaders, optimizer, scheduler, pad_token_id, vocab_size,
                         class_criterion=None, class_loss_weight=0.0, num_epochs=None, patience=None,
                         log_to_wandb=True, model_type="CNN_Decoder", setting_name=None,
-                        checkpoint_metadata=None, label_smoothing=0.1):
+                        checkpoint_metadata=None, label_smoothing=0.1, log_prefix=""):
     """trains CandyCrunch_CNN_Decoder to autoregressively generate IUPAC token sequences
 
     Mirrors train_model's epoch/early-stopping/checkpoint/plotting scaffolding (same SAM
@@ -646,6 +647,7 @@ def train_decoder_model(model, dataloaders, optimizer, scheduler, pad_token_id, 
     Returns the best model seen during training
     """
     since = time.time()
+    _wlog = lambda metrics: wandb.log({log_prefix + k: v for k, v in metrics.items()})
     early_stopping = EarlyStopping(patience = patience, verbose = True)
     best_model_wts = copy.deepcopy(model.state_dict())
     best_loss = 100.0
@@ -749,7 +751,7 @@ def train_decoder_model(model, dataloaders, optimizer, scheduler, pad_token_id, 
                 }
                 if epoch_class_acc is not None:
                     wandb_log[f'{phase}/class_accuracy'] = epoch_class_acc
-                wandb.log(wandb_log)
+                _wlog(wandb_log)
 
             metrics_dict[phase]["loss"].append(float(epoch_loss))
             metrics_dict[phase]["token_accuracy"].append(float(epoch_token_acc))
@@ -829,7 +831,7 @@ def train_decoder_model(model, dataloaders, optimizer, scheduler, pad_token_id, 
     torch.save(checkpoint, best_model_path)
 
     if log_to_wandb:
-        wandb.log({
+        _wlog({
             'training_plots/loss_curves': wandb.Image(plot_path),
             'best_metrics/best_val_loss': best_loss,
             'best_metrics/best_val_sequence_accuracy': best_token_acc,

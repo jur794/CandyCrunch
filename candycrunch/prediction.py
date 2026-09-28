@@ -29,10 +29,10 @@ from candycrunch.BPETokenizer import BPETokenizer
 from candycrunch.analysis import CandyCrumbs
 
 _, this_filename = os.path.split(__file__)
-this_dir ="/Users/xatava/CandyCrunch/training"
+this_dir ="/home/jurriaan/CandyCrunch_test/CandyCrunch/training"
 data_path = os.path.join(this_dir,'glycans.pkl')
 glycans = pickle.load(open(data_path, 'rb'))
-data_path = "/Users/xatava/CandyCrunch/candycrunch/glytoucan_mapping.pkl"
+data_path = "/home/jurriaan/CandyCrunch_test/CandyCrunch/candycrunch/glytoucan_mapping.pkl"
 glytoucan_mapping = pickle.load(open(data_path, 'rb'))
 device = "cpu"
 if torch.cuda.is_available():
@@ -44,7 +44,7 @@ MODEL_CLASSES = {
     "CandyCrunch_CNN_Decoder": CandyCrunch_CNN_Decoder,
 }
 
-MODEL_DIR = "/Users/xatava/CandyCrunch/training/models"
+MODEL_DIR = "/home/jurriaan/CandyCrunch_test/CandyCrunch/training/models"
 
 DEFAULT_MODEL_PATHS = {
     "CNN": os.path.join(MODEL_DIR, "CandyCrunch_CNN_GShS_DSS4.0.pt"),

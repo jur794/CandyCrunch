@@ -11,6 +11,7 @@ from sklearn.metrics import pairwise_distances
 import warnings
 import argparse
 import random
+import copy
 import candycrunch.model
 
 
@@ -68,6 +69,8 @@ def main(args):
         y_test = pickle.load(file)
     with open(f"./glycans.pkl", "rb") as file:
         glycans = pickle.load(file)
+    if isinstance(glycans, pd.DataFrame):  # OP datasets store glycans as a DataFrame with a 'glycan' column
+        glycans = glycans["glycan"].tolist()
 
     tokenizer = None
     if args.model == "CNN_Decoder":
@@ -88,7 +91,7 @@ def main(args):
         try:
             glycomp = glycan_to_composition(glyc)
             allowed_glycan_comps[glyc] = glycomp
-        except KeyError:
+        except (KeyError, ValueError):
             disallowed_glycans.append(glyc)
     comp_vector_order = list(set(x for y in allowed_glycan_comps.values() for x in y))
     comp_vector_order = sorted(comp_vector_order, key = lambda x: x.lower())
@@ -230,6 +233,7 @@ def main(args):
         setting_name = (f"CNNDec_{args.split}_{args.memory_mode}_D{args.d_model}L{args.dec_layers}"
                         f"_{args.dataset}")
 
+    setting_name += getattr(args, "setting_name_suffix", "")  # set by run_pipeline only
     checkpoint_metadata = {"checkpoint_version": 1, "model_class": checkpoint_model_class, "model_type": args.model,
                            "model_kwargs": model_kwargs, "glycans": list(glycans),
                            "comp_vector_order": list(comp_vector_order), "max_peaks": args.max_peaks,
@@ -252,9 +256,10 @@ def main(args):
             "beam_width": 25, "length_penalty": 0.7,
         }
 
-    os.environ["WANDB_API_KEY"] = "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"
-    wandb.init(project = f'CandyCrunch', entity = 'vahid-atabaigielmi-university-of-gothenburg', name = setting_name, save_code = True)
+    if wandb.run is None:  # run_pipeline creates the run itself
+        init_wandb(setting_name)
     model = model.apply(lambda module: init_weights(module, mode = 'kaiming'))
+
 
     if args.model == "CNN_Decoder":
         if args.resume_from:
@@ -313,7 +318,8 @@ def main(args):
             model_type = args.model,
             setting_name = setting_name,
             checkpoint_metadata = checkpoint_metadata,
-            label_smoothing = args.label_smoothing)
+            label_smoothing = args.label_smoothing,
+            log_prefix = getattr(args, "log_prefix", ""))
     else:
         model_ft = train_model(
             model,
@@ -327,9 +333,63 @@ def main(args):
             model_type = args.model,
             setting_name = setting_name,
             moe_aux_loss_weight = args.moe_aux_loss_weight,
-            checkpoint_metadata = checkpoint_metadata)
+            checkpoint_metadata = checkpoint_metadata,
+            log_prefix = getattr(args, "log_prefix", ""))
 
+    if not getattr(args, "keep_wandb_open", False):
+        wandb.finish()
+    return f"./models/CandyCrunch_{setting_name}.pt"  # where train_model / train_decoder_model saved the best weights
+
+
+def init_wandb(name, config = None):
+    os.environ["WANDB_API_KEY"] = "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"
+    wandb.init(project="CandyCrunch_juri", entity=("vahid-atabaigielmi-university-of-gothenburg"), name=name, config=config, save_code=True)
+
+
+def train_tokenizer(args):
+    """Trains the BPE tokenizer on the distinct labels of --tokenizer_corpus and saves it to a run-specific vocab file
+    (never the repo's bpe_vocab.json). Returns the vocab path."""
+    corpus_path = args.tokenizer_corpus or os.path.join(os.path.dirname(candycrunch.model.__file__), "y_train_CC2_240110.pkl")
+    with open(corpus_path, "rb") as file:
+        corpus = sorted(set(pickle.load(file)))
+    tokenizer = BPETokenizer()
+    tokenizer.train(corpus, target_vocab_size = args.tokenizer_vocab_size)
+    os.makedirs("./models", exist_ok = True)
+    vocab_path = f"./models/bpe_vocab_{args.dataset}_{args.split}_{args.tokenizer_vocab_size}_{os.getpid()}.json"
+    tokenizer.save_vocabulary(vocab_path)
+    print(f"Trained BPE tokenizer on {len(corpus)} distinct glycans from {corpus_path} -> {vocab_path} "
+          f"(vocab_size={tokenizer.vocab_size}, merges={len(tokenizer.merges)})")
+    return vocab_path
+
+
+def run_pipeline(args, user_pretrained_cnn):
+    """BPE tokenizer -> CNN encoder -> CNN decoder, all logged as ONE W&B run."""
+    decoder_args = copy.copy(args)
+    decoder_args.pretrained_cnn = user_pretrained_cnn
+    trained_vocab_path = None
+    if not (args.vocab_path or args.no_retrain_tokenizer or args.resume_from):
+        trained_vocab_path = decoder_args.vocab_path = train_tokenizer(args)
+    init_wandb(f"CNN_encoder_CNN_decoder_BPE_tokenizer_{args.dataset}_{args.split}_seed{args.current_seed}",
+               config = vars(decoder_args))
+    for stage in ("cnn_encoder", "cnn_decoder"):  # each stage plots against its own epochs
+        for phase in ("train", "val"):
+            wandb.define_metric(f"{stage}/{phase}/*", step_metric = f"{stage}/epoch")
+    if not (user_pretrained_cnn or args.resume_from or args.overfit_n):
+        cnn_args = copy.copy(args)
+        cnn_args.model, cnn_args.epoch = "CNN", args.cnn_epochs
+        cnn_args.log_prefix, cnn_args.keep_wandb_open = "cnn_encoder/", True
+        stage_start = time.time()
+        cnn_checkpoint = main(cnn_args)
+        assert os.path.exists(cnn_checkpoint) and os.path.getmtime(cnn_checkpoint) >= stage_start, \
+            f"CNN encoder checkpoint {cnn_checkpoint} was not written by this run"
+        decoder_args.pretrained_cnn = cnn_checkpoint
+    decoder_args.log_prefix = "cnn_decoder/"
+    decoder_args.setting_name_suffix = f"_seed{args.current_seed}"
+    decoder_args.keep_wandb_open = True
+    main(decoder_args)
     wandb.finish()
+    if trained_vocab_path:  # the decoder checkpoint already embeds the vocab
+        os.remove(trained_vocab_path)
 
 
 if __name__ == "__main__":
@@ -380,11 +440,23 @@ if __name__ == "__main__":
     parser.add_argument("--vocab_path", type = str, default = None,
                         help = "Path to a saved BPETokenizer vocab; default <candycrunch dir>/bpe_vocab.json.")
     parser.add_argument("--max_target_len", type = int, default = None)
+    # CNN_Decoder full pipeline: tokenizer -> CNN encoder -> decoder in one run
+    parser.add_argument("--tokenizer_corpus", type = str, default = None,
+                        help = "Pickle of glycan strings to train the BPE tokenizer on; default <candycrunch dir>/y_train_CC2_240110.pkl.")
+    parser.add_argument("--tokenizer_vocab_size", type = int, default = 1000)
+    parser.add_argument("--no_retrain_tokenizer", action = "store_true",
+                        help = "Do not train a tokenizer; load the default bpe_vocab.json (or --vocab_path).")
+    parser.add_argument("--cnn_epochs", type = int, default = 30,
+                        help = "Epochs for the CNN encoder stage (skipped with --pretrained_cnn, --resume_from or --overfit_n).")
     parser.add_argument('--random_seeds', nargs = '+', type = int, default = [42],
                         help = 'List of random seeds (default: [42, 123, 456, 789, 999])')
     args = parser.parse_args()
 
+    user_pretrained_cnn = args.pretrained_cnn  # per-seed pipelines must not inherit an earlier seed's CNN
     for seed in args.random_seeds:
         print(f"\n=== Running with seed {seed} ===")
         args.current_seed = seed
-        main(args)
+        if args.model == "CNN_Decoder":
+            run_pipeline(args, user_pretrained_cnn)
+        else:
+            main(args)
