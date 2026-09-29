@@ -376,15 +376,15 @@ def train_tokenizer(args):
 
 
 def run_pipeline(args, user_pretrained_cnn):
-    """BPE tokenizer -> CNN encoder -> CNN decoder, all logged as ONE W&B run."""
+    """BPE tokenizer -> CNN encoder -> Transformer decoder, all logged as ONE W&B run."""
     decoder_args = copy.copy(args)
     decoder_args.pretrained_cnn = user_pretrained_cnn
     trained_vocab_path = None
     if not (args.vocab_path or args.no_retrain_tokenizer or args.resume_from):
         trained_vocab_path = decoder_args.vocab_path = train_tokenizer(args)
-    init_wandb(f"CNN_encoder_CNN_decoder_BPE_tokenizer_{args.dataset}_{args.split}_seed{args.current_seed}",
+    init_wandb(f"CNN_encoder_Transformer_decoder_BPE_tokenizer_{args.dataset}_{args.split}_seed{args.current_seed}",
                config = vars(decoder_args))
-    for stage in ("cnn_encoder", "cnn_decoder"):  # each stage plots against its own epochs
+    for stage in ("cnn_encoder", "transformer_decoder"):  # each stage plots against its own epochs
         for phase in ("train", "val"):
             wandb.define_metric(f"{stage}/{phase}/*", step_metric = f"{stage}/epoch")
     if not (user_pretrained_cnn or args.resume_from or args.overfit_n):
@@ -396,7 +396,7 @@ def run_pipeline(args, user_pretrained_cnn):
         assert os.path.exists(cnn_checkpoint) and os.path.getmtime(cnn_checkpoint) >= stage_start, \
             f"CNN encoder checkpoint {cnn_checkpoint} was not written by this run"
         decoder_args.pretrained_cnn = cnn_checkpoint
-    decoder_args.log_prefix = "cnn_decoder/"
+    decoder_args.log_prefix = "transformer_decoder/"
     decoder_args.setting_name_suffix = f"_seed{args.current_seed}"
     decoder_args.keep_wandb_open = True
     main(decoder_args)
